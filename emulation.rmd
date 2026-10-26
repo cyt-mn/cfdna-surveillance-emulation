@@ -1,0 +1,2626 @@
+---
+title: "Utah cfDNA Target Trial Emulation"
+output: html_document
+---
+
+```{r Load Libraries}
+# Libraries.
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(purrr)
+library(tidyr)
+library(cluster)
+library(rstatix)
+library(survival)
+library(survminer)
+library(forcats)
+
+pirche_colors <- c("#7CC89C", "#9D4180")
+pirche_primary_one_colors <- c("#E9DFE7", "#9D4180")
+pirche_primary_two_colors <- c("#ECF1EB", "#7CC89C")
+pirche_gradient_11 <- c("#7ec99d","#88bd82","#95b06b","#a1a259","#ac934e","#b5834b","#bb724e","#bd6157","#b95264","#af4772","#9e4281")
+pirche_gradient_8 <- c("#7cc89c", "#72c4b6", "#67aac0", "#5d7dbb", "#5a53b7", "#7c4ab1", "#9e45a7", "#9d4180")
+pirche_gradient_3 <- c("#7ec99d", "#b5834b", "#9e4281")
+
+natera_green <- "#A4C954"
+caredx_red <- "#D12D3A"
+eurofins_blue <- "#1F3C88"
+cfdna_vendors <- c(
+  "Prospera (Natera)" = natera_green,
+  "Allosure (CareDx)" = caredx_red,
+  "TRAC (Eurofins)" = eurofins_blue)
+  
+pirche_green <- pirche_colors[1]
+pirche_purple <- pirche_colors[2]
+
+pirche_summer_green <- pirche_colors[1]
+pirche_ocean_green <- "#499F7E"
+pirche_cannon_pink <- pirche_colors[2]
+pirche_plum <- "#6E3061"
+pirche_teal <- "#022F3A"
+pirche_dark_plum <- "#200A19"
+
+fig_width <- 16
+fig_height <- 12
+```
+
+```{r Define Functions}
+# Functions
+
+spaghetti_plot <- function(data, title) {
+  result <- data %>%
+          filter(!is.na(value_cfdna)) %>%
+
+          # Added color = as.factor(patient_id) to the aesthetics mapping
+          ggplot(aes(x = assigned_month, y = value_cfdna, group = patient_id, color = as.factor(patient_id))) +
+
+          # Removed the static color assignments from geom_line and geom_point
+          geom_line(alpha = 0.5) +
+          geom_point(alpha = 0.7, size = 1.5) +
+
+          geom_hline(yintercept = 1.0, linetype = "dashed", color = "red", alpha = 0.7) +
+
+          theme_minimal() +
+          labs(
+                  title = paste0("Longitudinal dd-cfDNA Trajectories - ", title),
+                  subtitle = "Each color represents a different patient. Red dashed line indicates 1.0% threshold.",
+                  x = "Time (Months)",
+                  y = "dd-cfDNA (%)"
+          ) +
+
+          scale_x_continuous(breaks = target_months) +
+          # scale_y_continuous(trans='log2') +
+          theme(
+                  plot.title = element_text(face = "bold", size = 14),
+                  panel.grid.minor.x = element_blank(),
+
+                  # CRITICAL: Hide the legend!
+                  # If you have dozens or hundreds of patients, the legend will take up the whole screen.
+                  legend.position = "none"
+          )
+  result
+}
+
+
+spaghetti_plot_categorical <- function(data, title) {
+  result <- data %>%
+    filter(!is.na(value_cfdna)) %>%
+
+    # Added color = as.factor(patient_id) to the aesthetics mapping
+    ggplot(aes(x = assigned_month, y = positivity, group = patient_id, color = as.factor(patient_id))) +
+
+    # Removed the static color assignments from geom_line and geom_point
+    geom_line(alpha = 0.5) +
+    geom_point(alpha = 0.7, size = 1.5) +
+
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "red", alpha = 0.7) +
+
+    theme_minimal() +
+    labs(
+      title = paste0("Longitudinal dd-cfDNA Trajectories (categorical) - ", title),
+      subtitle = "Each color represents a different patient.",
+      x = "Time (Months)",
+      y = "dd-cfDNA positive"
+    ) +
+
+    scale_x_continuous(breaks = target_months) +
+    # scale_y_continuous(trans='log2') +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      panel.grid.minor.x = element_blank(),
+      legend.position = "none"
+    )
+  result
+}
+
+
+transition_intervals_calc <- function(data, keep_all_patients = FALSE) {
+  result <- data %>%
+    arrange(patient_id, cfdna_time) %>%
+    group_by(patient_id) %>%
+    summarise(
+      # Find the time of the FIRST positive test (suppress warnings for patients with no positive tests)
+      first_pos_time = suppressWarnings(min(cfdna_time[positivity == 1], na.rm = TRUE)),
+
+      # Find the time of the LAST negative test strictly BEFORE that first positive test
+      last_neg_time = suppressWarnings(max(0, cfdna_time[positivity == 0 & cfdna_time < first_pos_time], na.rm = TRUE)),
+      
+      # --- NEW: Tracks the very last recorded test timepoint for the patient ---
+      last_cfdna_time = suppressWarnings(max(cfdna_time, na.rm = TRUE)),
+
+      .groups = "drop"
+    ) 
+  
+  print(result)
+  print("Raw")
+  print(nrow(result))
+  
+  # --- NEW: Conditional evaluation of the filter sequence based on your boolean flag ---
+  if (!keep_all_patients) {
+    print("Filter finite pos time")
+    result <- result %>% filter(is.finite(first_pos_time))
+    print(nrow(result))
+    
+    print("Filter last neg time")
+    result <- result %>% filter(is.finite(last_neg_time))
+  } else {
+    print("Bypassing filters: Keeping all patients (converting Inf/-Inf markers to NA/NaN)")
+    # Clean up the mathematical Inf/-Inf values that min/max generate on empty vectors
+    # so they don't break downstream statistical modeling packages.
+    result <- result %>%
+      mutate(
+        first_pos_time = if_else(is.finite(first_pos_time), first_pos_time, NaN),
+        last_neg_time  = if_else(is.finite(last_neg_time), last_neg_time, NaN),
+        last_cfdna_time = if_else(is.finite(last_cfdna_time), last_cfdna_time, NaN)
+      )
+  }
+  print(nrow(result))
+  
+  return(result)
+}
+
+cfdna_positivity <- function(cfdna, persist_positivity = TRUE) {
+  result <- cfdna %>%
+    # 1. Sort by patient and date to ensure chronological order
+    arrange(patient_id, cfdna_time) %>%
+    
+    # 2. Group by patient so we don't accidentally compare 
+    # the first test of Patient B to the last test of Patient A
+    group_by(patient_id) %>%
+    
+    # 3. Create the necessary variables
+    mutate(
+      # Fetch the previous measurement using lag()
+      prev_dd_cfdna = lag(value_cfdna),
+      
+      # Calculate the relative increase
+      relative_increase = (value_cfdna - prev_dd_cfdna) / prev_dd_cfdna,
+      
+      # Create the binary positivity variable (1 = positive, 0 = negative)
+      positivity = case_when(
+        is.na(value_cfdna) ~ NA_real_,
+        value_cfdna >= 1.0 ~ 1,
+        value_cfdna >= 0.5 & relative_increase >= 0.61 & !is.infinite(relative_increase) ~ 1,
+        TRUE ~ 0
+      )
+    )
+  
+  # --- NEW LOGIC: Make positivity persistent if the parameter is TRUE ---
+  if (persist_positivity) {
+    result <- result %>%
+      mutate(
+        # cummax() calculates the rolling maximum. Once it sees a 1, it stays 1.
+        # coalesce(positivity, 0) ensures NAs don't break the cummax calculation.
+        positivity = if_else(cummax(coalesce(positivity, 0)) == 1, 1, positivity)
+      )
+  }
+  
+  # 4. Ungroup the data to prevent issues in future analyses
+  result <- result %>%
+    ungroup()
+  
+  return(result)
+}
+
+cfdna_positivity_scheduled <- function(cfdna, schedule = c(36)) {
+  
+  schedule <- sort(schedule)
+
+  result <- cfdna %>%
+    # 1. Sort chronologically per patient
+    arrange(patient_id, cfdna_time) %>%
+    
+    # 2. Group by patient
+    group_by(patient_id) %>%
+    
+    # 3. Calculate baseline positivity
+    mutate(
+      prev_dd_cfdna = lag(value_cfdna),
+      relative_increase = (value_cfdna - prev_dd_cfdna) / prev_dd_cfdna,
+      
+      positivity = case_when(
+        is.na(value_cfdna) ~ NA_real_,
+        value_cfdna >= 1.0 & type_cfdna == 1 ~ 1,
+        value_cfdna >= 0.5 & relative_increase >= 0.61 & !is.infinite(relative_increase) ~ 1,
+        TRUE ~ 0
+      )
+    )
+
+  # 4. Persistence with dynamic reset AFTER scheduled samples
+  result <- result %>%
+    mutate(
+      # ADDED `left.open = TRUE`
+      # This ensures exact milestone matches (e.g., 36) stay in the previous interval.
+      # The interval only increments for values strictly greater than the milestone.
+      sched_milestone = findInterval(assigned_month, schedule, left.open = TRUE),
+      
+      # Check if the milestone index changed compared to the previous sample.
+      is_reset_point = sched_milestone != lag(sched_milestone, default = -1),
+      
+      # Create persistent block IDs: increments ONLY strictly after a scheduled milestone
+      reset_block = cumsum(is_reset_point)
+    ) %>%
+    # Group by patient AND reset block
+    group_by(patient_id, reset_block) %>%
+    mutate(
+      # Roll positivity forward across unscheduled/missed intervals,
+      # resetting only when a sample enters a new block
+      positivity = if_else(
+        is.na(positivity), 
+        NA_real_, 
+        cummax(coalesce(positivity, 0))
+      )
+    ) %>%
+    # Regroup back to patient level and clean up helper columns
+    group_by(patient_id) %>%
+    select(-sched_milestone, -is_reset_point, -reset_block)
+
+  # 5. Clean up groups
+  result <- result %>%
+    ungroup() %>% 
+    filter(!is.na(positivity))
+
+  return(result)
+}
+
+filter_post_positivity <- function(data) {
+  result <- data %>%
+    # 1. Ensure the observations are strictly chronological per patient
+    arrange(patient_id, cfdna_time) %>%
+    group_by(patient_id) %>%
+    
+    # 2. Apply the drop logic using a lagging cumulative sum
+    filter(
+      # Calculate the running total of positive tests up to the PREVIOUS row.
+      # coalesce() handles the first row's lag safely by turning NA into 0.
+      coalesce(lag(cumsum(coalesce(positivity, 0))), 0) == 0
+    ) %>%
+    
+    # 3. Always ungroup to protect downstream statistical modeling
+    ungroup()
+  
+  return(result)
+}
+
+```
+
+Reading all datasets provided by Utah. Starting with a total number of patients...
+```{r Fetch data and base definitions}
+# Definitions:
+observation_time <- 3*365
+days_per_month <- 365 / 12.
+pirche_cutoff <- 50
+min_samples <- 4
+manuscript_root <- "/Users/pir-mn/Library/CloudStorage/GoogleDrive-matthias.niemann@pirche.com/Geteilte Ablagen/PIR R&D/Projects/cfDNA Target Trial Emulation/manuscript_figures/"
+
+supplement <- "supplement/"
+
+# Read the 4 Stata files into separate data frames
+biopsy <- read_dta("/Users/pir-mn/Library/CloudStorage/GoogleDrive-matthias.niemann@pirche.com/Geteilte Ablagen/PIR Bioinformatic Resources/Utah TTE/input/pirche_biopsy_data_Matthias.dta")
+cfdna <- read_dta("/Users/pir-mn/Library/CloudStorage/GoogleDrive-matthias.niemann@pirche.com/Geteilte Ablagen/PIR Bioinformatic Resources/Utah TTE/input/pirche_cfdna_data_Matthias.dta")
+dsa <- read_dta("/Users/pir-mn/Library/CloudStorage/GoogleDrive-matthias.niemann@pirche.com/Geteilte Ablagen/PIR Bioinformatic Resources/Utah TTE/input/pirche_dsa_data_Matthias.dta")
+core <- read_dta("/Users/pir-mn/Library/CloudStorage/GoogleDrive-matthias.niemann@pirche.com/Geteilte Ablagen/PIR Bioinformatic Resources/Utah TTE/input/pirche_core_data_Matthias.dta")
+core <- core %>% mutate(PIRCHE_II_A = as.numeric(PIRCHE_II_A), PIRCHE_II_B = as.numeric(PIRCHE_II_B), PIRCHE_II_C = as.numeric(PIRCHE_II_C), PIRCHE_II_DRB1 = as.numeric(PIRCHE_II_DRB1), PIRCHE_II_DQB1 = as.numeric(PIRCHE_II_DQB1), PIRCHE_II_ClassII = PIRCHE_II_DRB1 + PIRCHE_II_DQB1)
+
+cfdna <- cfdna %>%
+  mutate(
+    value_cfdna_raw = value_cfdna,
+    value_cfdna = case_when(
+      # Check for specific company names (ignoring uppercase/lowercase just to be safe)
+      2 == type_cfdna ~ value_cfdna_raw * 1.,#,0.71,
+      3 == type_cfdna ~ value_cfdna_raw * 1.,#0.625,
+      1 == type_cfdna ~ value_cfdna_raw    )
+  )# %>% filter(type_cfdna == 1)
+
+cfdna_binary <- cfdna_positivity(cfdna)
+length(unique(cfdna_binary %>% pull(patient_id)))
+```
+
+```{r Original and reduced schedules}
+# original planned schedule
+target_months <- c(1, 2, 3, 4, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36)
+reduced_months <- c(1, 2, 3, 4, 6, 9, 12, 24, 36) # first year full, then reduced
+reduced_months <- c(6, 12, 15, 18, 21, 24, 27, 30, 33, 36) # first year reduced, then full
+reduced_months <- c(1, 4, 6, 9, 18, 27, 36)
+reduced_months <- c(12, 24, 36) # yearly
+reduced_months <- c(2, 4, 6, 12, 24, 36)
+reduced_months <- c(3, 6, 12, 24, 36)
+reduced_months <- c(3, 6, 9, 12, 24,36) # quarterly, then yearly
+
+
+### plot frequency
+plot_data <- data.frame(
+  x_value = c(target_months, reduced_months),
+  y_index = c(rep(1, length(target_months)), rep(2, length(reduced_months))),
+  group_id = c(rep("Extended", length(target_months)), rep("Standard", length(reduced_months)))
+)
+
+plot_data$group_id <- factor(plot_data$group_id, levels = c("Standard", "Extended"))
+
+# 3. Create the ggplot
+schedule <- ggplot(plot_data, aes(x = x_value, y = y_index, color = group_id, shape = group_id)) +
+
+  # Add points (increase size for visibility)
+  geom_point(size = 4, alpha = 0.8) +
+
+  # Optional: Manually choose your colors and symbols
+  scale_color_manual(values = c("Extended" = pirche_colors[1], "Standard" = pirche_colors[2])) +
+  scale_shape_manual(values = c("Extended" = 17, "Standard" = 15)) +
+  ylim(0,4) +
+  scale_x_continuous(breaks = seq(0, max(plot_data$x_value), by = 1)) +
+  # Clean up the theme
+  theme_minimal() +
+  theme(
+    axis.title.y = element_blank(), # Removes the label "y"
+    axis.text.y  = element_blank(), # Removes the numbers (1, 2, 3...)
+    axis.ticks.y = element_blank()  # Removes the little tick marks
+  ) +
+  labs(
+    title = "Frequency of immune monitoring",
+    x = "Days post Tx",
+    y = "Index",
+    color = "Schedule",
+    shape = "Schedule"
+  )
+print(schedule)
+```
+# Descriptional Analysis of cfDNA Trajectories
+Cluster the longitudinal data to identify the most likely surveillance schedule, to confirm the data matches what the clinic had in their protocol.
+```{r Cluster time points and confirm testing schedule}
+
+######## Figure out how many visits and when these visits are clustered #######
+k_values <- 6:20
+valid_times <- cfdna %>%
+  filter(!is.na(cfdna_time)) %>%
+  pull(cfdna_time)
+
+# Calculate the "Total Within Sum of Squares" (variance) for each K
+variance_explained <- map_dbl(k_values, function(k) {
+  model <- kmeans(valid_times, centers = k, nstart = 10)
+  return(model$tot.withinss)
+})
+
+# Plot the Elbow Curve
+tibble(K = k_values, Variance = variance_explained) %>%
+  ggplot(aes(x = K, y = Variance)) +
+  geom_line(color = pirche_primary_one_colors[1], linewidth = 1) +
+  geom_point(color = pirche_primary_one_colors[2], size = 3) +
+  scale_x_continuous(breaks = 1:20) +
+  theme_minimal() +
+  labs(
+    title = "Elbow Method for Determining Number of Scheduled Visits",
+    subtitle = "Look for the 'elbow' where the line starts to flatten out",
+    x = "Number of Clusters (Scheduled Visits)",
+    y = "Total Within-Cluster Variance"
+  )
+
+
+# 2. Run K-medoids clustering (essentially K-means but with medians - thus less susceptible for supergravity of outliers)
+# set.seed ensures you get the exact same clusters every time you run the script
+set.seed(42)
+num_expected_visits <- 15
+medoids <- pam(valid_times, k = num_expected_visits)
+
+# 3. Extract the cluster centers (these are your data-driven schedule days)
+data_driven_days <- sort(as.numeric(medoids$medoids))
+
+chronological_order <- order(medoids$medoids)
+ordered_test_counts <- medoids$size[chronological_order]
+
+# 2. Rebuild the discovery table with the counts included
+schedule_discovery <- tibble(
+  Visit_Number = 1:num_expected_visits,
+  Approx_Days = round(data_driven_days, 1),
+  Approx_Months = round(data_driven_days / days_per_month, 1),
+
+  # Add the number of data points (tests) per cluster
+  Number_of_Tests = ordered_test_counts
+)
+
+tibble(Time = valid_times) %>%
+ggplot(aes(x = Time)) +
+
+  # 1. Plot the density of the actual testing days
+  geom_density(
+    fill = pirche_primary_two_colors[2],
+    alpha = 0.4,       # Semi-transparent fill
+    color = pirche_primary_two_colors[2], # Outline color
+    adjust = 0.25
+  ) +
+
+  # 2. Add the vertical lines for the discovered clusters
+  geom_vline(
+    data = schedule_discovery,
+    aes(xintercept = Approx_Days),
+    color = pirche_primary_one_colors[1],
+    linetype = "dashed",
+    linewidth = 0.8  # Note: Use 'size' instead of 'linewidth' if using an older version of ggplot2
+  ) +
+
+  geom_vline(
+    data = tibble(months = target_months * 30.4375),
+    aes(xintercept = months),
+    color = pirche_primary_one_colors[2],
+    linetype = "dashed",
+    linewidth = 1.0
+  ) +
+
+  # 3. Clean up the aesthetics
+  theme_minimal() +
+  labs(
+    title = "Density of cfDNA Test Times",
+    subtitle = "Grey dashed lines indicate data-driven schedule points (K-Medoids Centers), purple dashed lines indicate manually defined testing",
+    x = "Time of Test (Days)",
+    y = "Density"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+schedule_discovery
+########################################################################
+```
+```{r Temporal Alignment}
+# temporal adjustment
+target_days <- target_months * days_per_month
+cfdna_aligned <- cfdna_binary %>%
+  mutate(
+    # map_dbl iterates through every single cfdna_time value
+    assigned_month = map_dbl(cfdna_time, ~ {
+      # Handle missing values safely
+      if (is.na(.x)) return(NA_real_)
+
+      # Calculate the absolute difference between the actual test day and all target days
+      distances <- abs(target_days - .x)
+
+      # Find the index of the smallest distance
+      closest_idx <- which.min(distances)
+
+      # Return the corresponding month from our original target_months list
+      target_months[closest_idx]
+    })
+  )
+
+  # Keep only the cfDNA value with the value in case of duplicates per month
+cfdna_aligned_unique <- cfdna_aligned %>%
+  group_by(patient_id, assigned_month) %>%
+
+  slice_max(order_by = value_cfdna, n = 1, with_ties = FALSE) %>%
+
+  # 3. Ungroup the data for downstream analysis
+  ungroup() %>%
+  left_join(
+    select(core, patient_id, PIRCHE_II),
+    by = "patient_id"
+  )
+```
+
+Only keep cases with X+ CFDNA tests within the first year. Number of considered patients
+```{r Filter cases and create random event onset date}
+
+# only keep cases with a number of CFDNA tests within the first year
+cfdna_filtered <- cfdna_aligned_unique %>%
+  group_by(patient_id) %>%
+  filter(!is.na(cfdna_time)) %>%
+  filter(cfdna_time < observation_time) %>%
+  filter(sum(cfdna_time < 14 * days_per_month, na.rm = TRUE) >= min_samples) %>%
+  ungroup()
+
+
+# only keep patients with the appropriate CFDNA schedule
+core_filtered <- core %>% filter(patient_id %in% (cfdna_filtered %>% pull(patient_id)))
+print(nrow(core_filtered))
+
+```
+
+Number of positive patients
+```{r Number of positives}
+print(length(unique(cfdna_filtered %>% filter(positivity == 1) %>% pull(patient_id))))
+```
+```{r cfdna vendors}
+
+# 1. Clean the data: Filter out Omnigraf and drop the empty factor level
+plot_type_data <- cfdna_filtered %>%
+  # Filter out the specific rows
+  filter(type_cfdna != 4) %>%
+  filter(!is.na(type_cfdna) & !is.na(value_cfdna)) %>%
+  
+  # Convert to factor AND explicitly drop unused levels
+  mutate(type_cfdna = fct_drop(as_factor(type_cfdna)))
+
+print(paste0("total tests:",  nrow(plot_type_data)))
+
+type_fractions <- plot_type_data %>%
+  # 1. Count the occurrences of each cfDNA type
+  count(type_cfdna, name = "Count") %>%
+  
+  # 2. Calculate the raw fraction and format it as a readable percentage
+  mutate(
+    Fraction = Count / sum(Count),
+    Percentage = scales::percent(Fraction, accuracy = 0.1) # e.g., 45.2%
+  ) %>%
+  
+  # 3. Sort from most common to least common
+  arrange(desc(Fraction))
+
+# Print the result to the console
+print(type_fractions)
+
+
+cfdna_raw_medians_by_type <- cfdna_filtered %>%
+  # 1. Group by the cfDNA assay type
+  group_by(type_cfdna) %>%
+  
+  # 2. Calculate the median and count the total samples
+  summarise(
+    Median_cfDNA = median(value_cfdna_raw, na.rm = TRUE),
+    Total_Samples = n(),
+    .groups = "drop"
+  ) %>%
+  
+  # 3. Sort by the highest median first (optional)
+  arrange(desc(Median_cfDNA))
+
+# Print the result to the console
+print(cfdna_raw_medians_by_type)
+
+cfdna_medians_by_type <- cfdna_filtered %>%
+  # 1. Group by the cfDNA assay type
+  group_by(type_cfdna) %>%
+  
+  # 2. Calculate the median and count the total samples
+  summarise(
+    Median_cfDNA = median(value_cfdna, na.rm = TRUE),
+    Total_Samples = n(),
+    .groups = "drop"
+  ) %>%
+  
+  # 3. Sort by the highest median first (optional)
+  arrange(desc(Median_cfDNA))
+
+# Print the result to the console
+print(cfdna_medians_by_type)
+
+# 2. Calculate the statistical significance (Pairwise Wilcoxon Test)
+# Now safely executes without empty level errors!
+unique_vendors <- unique(plot_type_data$type_cfdna)
+if (length(unique_vendors) >= 2) {
+  # --- Standard execution if multiple groups exist ---
+  stat_test <- plot_type_data %>%
+    wilcox_test(value_cfdna ~ type_cfdna) %>%
+    adjust_pvalue(method = "bonferroni") %>%
+    add_significance()
+    
+} else {
+  # --- Safety fallback if only 1 vendor type is present ---
+  message("Only one cfDNA vendor type detected (", unique_vendors, "). Skipping Wilcoxon test.")
+  
+  # Create a placeholder dataframe with the exact same structure rstatix returns
+  # so that your downstream plotting/printing functions don't break.
+  stat_test <- tibble(
+    .y. = "value_cfdna",
+    group1 = unique_vendors,
+    group2 = "None",
+    n1 = nrow(plot_type_data),
+    n2 = 0,
+    statistic = NA_real_,
+    p = NA_real_,
+    p.adj = NA_real_,
+    p.adj.signif = "ns"
+  )
+}
+
+# 3. Calculate non-outlier upper whisker limit to set the zoom window safely
+whisker_data <- plot_type_data %>%
+  summarise(
+    q3 = quantile(value_cfdna, 0.75),
+    iqr = IQR(value_cfdna),
+    upper_whisker = q3 + (1.5 * iqr)
+  )
+global_whisker_max <- max(whisker_data$upper_whisker)
+
+# 4. Manually set the height for the significance brackets right above the whiskers
+stat_test_enriched <- stat_test %>%
+  mutate(
+    y.position = global_whisker_max + (row_number() * 0.2)
+  )
+
+# 5. Generate the Boxplot with Significance Brackets
+cfdna_value_boxplot <- ggplot(plot_type_data, aes(x = type_cfdna, y = value_cfdna, fill = type_cfdna)) +
+  
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.shape = NA, 
+    width = 0.5
+  ) +
+  
+  stat_pvalue_manual(
+    stat_test_enriched, 
+    label = "p.adj.signif", 
+    tip.length = 0.001
+  ) +
+  
+  coord_cartesian(ylim = c(0, max(stat_test_enriched$y.position) * 1.1)) +
+  
+  theme_minimal() +
+  labs(
+    title = "Comparison of dd-cfDNA Values by Assay Type",
+    subtitle = "Brackets indicate Bonferroni-adjusted pairwise Wilcoxon significance, outliers hidden",
+    x = "Assay Platform Type",
+    y = "dd-cfDNA (%)"
+  ) +
+  
+  scale_fill_manual(values = cfdna_vendors) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none", 
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  )
+print(cfdna_value_boxplot)
+ggsave(paste0(manuscript_root, supplement, "cfdna_value_boxplot.png"), plot = cfdna_value_boxplot, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+# 1. Clean data and calculate overall positivity rate per assay type
+plot_rate_data <- cfdna_filtered %>%
+  # Filter out missing records and drop the Omnigraf level
+  filter(!is.na(type_cfdna) & !is.na(positivity)) %>%
+  mutate(type_cfdna_text = as.character(as_factor(type_cfdna))) %>%
+  filter(type_cfdna_text != "Omnigraf (TRAC+Trugraf by Eurofins)") %>%
+  
+  # Group by assay type to get the global proportion of positive tests
+  group_by(type_cfdna_text) %>%
+  summarise(
+    positivity_rate = mean(positivity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  
+  # --- NEW: Reorder the factor levels by positivity_rate in descending order ---
+  mutate(type_cfdna = fct_reorder(factor(type_cfdna_text), positivity_rate, .desc = TRUE))
+
+print(plot_rate_data)
+
+
+# 2. Generate the Bar Chart
+cfdna_positivity_rate <- ggplot(plot_rate_data, aes(x = type_cfdna, y = positivity_rate, fill = type_cfdna)) +
+  
+  # Using geom_col since we pre-computed the rates
+  geom_col(
+    alpha = 0.8,
+    width = 0.5
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "Overall ddcfDNA Positivity Rate by Assay Type",
+    subtitle = "Proportion of positive tests relative to the total tests performed",
+    x = "Assay Platform Type",
+    y = "Positivity Rate (Proportion)"
+  ) +
+  
+  # Optional: Uncomment the line below if you prefer percentage labels (e.g., 15%) instead of decimals (0.15)
+  # scale_y_continuous(labels = scales::percent_format()) +
+  
+  scale_fill_manual(values = cfdna_vendors) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none", 
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  )
+print(cfdna_positivity_rate)
+ggsave(paste0(manuscript_root, supplement, "cfdna_positivity_rate.png"), plot = cfdna_positivity_rate, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+```
+
+```{r Time-dependent hit-rate}
+low_pirche_label <- paste0("Low PIRCHE-T2 (<", pirche_cutoff, ")")
+high_pirche_label <- paste0("High PIRCHE-T2 (≥", pirche_cutoff, ")")
+
+cfdna_transient <- cfdna_positivity(cfdna_filtered, persist_positivity = FALSE)
+
+# 1. Prepare the data: Calculate Ratio and Power, then filter out low-volume bars
+plot_pirche_ratios <- cfdna_transient %>%
+  filter(!is.na(positivity) & !is.na(PIRCHE_II)) %>%
+  
+  mutate(
+    PIRCHE_Group = if_else(PIRCHE_II < pirche_cutoff, low_pirche_label, high_pirche_label)
+  ) %>%
+  
+  group_by(assigned_month, PIRCHE_Group) %>%
+  summarise(
+    Ratio = sum(positivity == 1) / n(),
+    Total_Tests = n(),
+    .groups = "drop"
+  ) %>%
+  
+  # --- NEW: Only keep bars that meet your data point threshold ---
+  filter(Total_Tests > 15)
+
+plot_pirche_ratios$PIRCHE_Group <- factor(
+  plot_pirche_ratios$PIRCHE_Group, 
+  levels = c(low_pirche_label, high_pirche_label)
+)
+
+custom_palette <- setNames(
+  c(pirche_green, pirche_purple), 
+  c(low_pirche_label, high_pirche_label)
+)
+
+plot_pirche_ratios <- plot_pirche_ratios %>%
+  group_by(assigned_month) %>%
+  mutate(
+    # If this row is the highest ratio for the month, push it UP (+0.04)
+    # Otherwise, push it DOWN (-0.04)
+    y_nudge = if_else(Ratio == max(Ratio) | Ratio < 0.01, 0.01, -0.02)
+  ) %>%
+  ungroup()
+
+# 2. Generate the Grouped Bar Plot
+library(ggrepel)
+
+positivity_ratio_plot <- ggplot(plot_pirche_ratios, aes(x = assigned_month, y = Ratio, color = PIRCHE_Group)) +
+  
+  geom_line(alpha = 0.85, linewidth = 0.8) +
+  geom_point(size = 2, alpha = 0.85) + 
+  
+  geom_label_repel(
+    aes(label = paste0("n = ", Total_Tests)),
+    
+    # 1. Feed the custom directional vector into nudge_y
+    nudge_y = plot_pirche_ratios$y_nudge, 
+    
+    # 2. Lock vertical movement so ggrepel doesn't undo your nudges
+    direction = "x",        
+    
+    size = 3,
+    fontface = "bold",
+    show.legend = FALSE,
+    segment.color = "gray80", # Optional: adds a faint line connecting text to the point
+    segment.size = 0.3
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "Transient ddcfDNA Positivity Ratio by PIRCHE-T2",
+    x = "Time Post-Transplant (Months)",
+    y = "Positivity Ratio",
+    color = "Immunological Risk Group" 
+  ) +
+  
+  scale_x_continuous(breaks = target_months) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.05))) +
+  scale_color_manual(values = custom_palette) +
+  
+  theme(
+    panel.grid.minor.x = element_blank(),
+    legend.position = "top"
+  )
+print(positivity_ratio_plot)
+ggsave(paste0(manuscript_root, "positivity_ratio.png"), plot = positivity_ratio_plot, dpi = dpi, width = 1.2*fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+```
+
+```{r x-fold increased hit rate}
+library(tidyverse)
+
+# 1. Reshape the longitudinal data frame and strip out zero-positivity months safely
+monthly_fold_changes <- plot_pirche_ratios %>%
+  # Standardize labels to clean column suffixes for pivoting
+  mutate(Risk_Type = if_else(grepl("Low", PIRCHE_Group), "Low_Ratio", "High_Ratio")) %>%
+  select(assigned_month, Risk_Type, Ratio) %>%
+  
+  # FIX: Cleanly handle duplicates by taking the mean if multiple rows exist
+  pivot_wider(
+    names_from = Risk_Type, 
+    values_from = Ratio,
+    values_fn = list(Ratio = mean) # Safely squashes list-cols into true doubles
+  ) %>%
+  
+  # Exclude months lacking complete data or where either group hits 0%
+  filter(!is.na(Low_Ratio) & !is.na(High_Ratio) & Low_Ratio > 0 & High_Ratio > 0) %>%
+  
+  # Calculate the month-specific fold change
+  mutate(Fold_Increase = High_Ratio / Low_Ratio)
+
+# 2. Extract aggregate descriptive statistics (Median & IQR) across non-zero months
+aggregate_metrics <- monthly_fold_changes %>%
+  summarise(
+    Median_Fold    = median(Fold_Increase),
+    IQR_Lower_25th = quantile(Fold_Increase, 0.25),
+    IQR_Upper_75th = quantile(Fold_Increase, 0.75),
+    Total_Months   = n()
+  )
+
+# 3. Output Month-by-Month breakdown to console
+cat("\n=== Distribution low PIRCHE (ZERO-POINTS EXCLUDED) ===\n")
+print(summary(monthly_fold_changes %>% pull(Low_Ratio)))
+
+cat("\n=== Distribution high PIRCHE (ZERO-POINTS EXCLUDED) ===\n")
+print(summary(monthly_fold_changes %>% pull(High_Ratio)))
+
+cat("\n=== MONTHLY TRAJECTORY BREAKDOWN (ZERO-POINTS EXCLUDED) ===\n")
+print(monthly_fold_changes %>% select(assigned_month, Low_Ratio, High_Ratio, Fold_Increase))
+
+# 4. Output Summary Metrics to console
+cat("\n=== AGGREGATE SUMMARY FOOTPRINT ===\n")
+cat(paste0("Total Months Evaluated:   ", aggregate_metrics$Total_Months, "\n"))
+cat(paste0("Median Fold Increase:     ", round(aggregate_metrics$Median_Fold, 2), "x\n"))
+cat(paste0("IQR Fold Increase Range: [", round(aggregate_metrics$IQR_Lower_25th, 2), "x - ", round(aggregate_metrics$IQR_Upper_75th, 2), "x]\n"))
+cat("====================================\n")
+```
+
+```{r}
+library(tidyverse)
+
+cfdna_transient <- cfdna_positivity(cfdna_filtered, persist_positivity = FALSE)
+
+# 1. Calculate dynamic tertile boundaries based on unique baseline patient values
+tertile_cuts <- cfdna_transient %>%
+  filter(!is.na(PIRCHE_II)) %>%
+  distinct(patient_id, PIRCHE_II) %>% # Ensure each patient contributes only once to the boundary calculations
+  mutate(tertile_num = ntile(PIRCHE_II, 3)) %>%
+  group_by(tertile_num) %>%
+  summarise(min_val = min(PIRCHE_II), max_val = max(PIRCHE_II), .groups = "drop")
+
+# 2. Build explicit labels using the calculated dynamic boundaries
+t1_label <- paste0("Low PIRCHE-T2 [", tertile_cuts$min_val[1], "-", tertile_cuts$max_val[1], "]")
+t2_label <- paste0("Int PIRCHE-T2 (", tertile_cuts$min_val[2], "-", tertile_cuts$max_val[2], "]")
+t3_label <- paste0("High PIRCHE-T2 (", tertile_cuts$min_val[3], "-", tertile_cuts$max_val[3], "]")
+
+all_groups <- c(t1_label, t2_label, t3_label)
+
+# 3. Process the data into the 3-tier structure
+plot_pirche_ratios <- cfdna_transient %>%
+  filter(!is.na(positivity) & !is.na(PIRCHE_II)) %>%
+  mutate(
+    # Apply global ntile categorization
+    tertile_rank = ntile(PIRCHE_II, 3),
+    PIRCHE_Group = case_when(
+      tertile_rank == 1 ~ t1_label,
+      tertile_rank == 2 ~ t2_label,
+      tertile_rank == 3 ~ t3_label
+    )
+  ) %>%
+  group_by(assigned_month, PIRCHE_Group) %>%
+  summarise(
+    Ratio = sum(positivity == 1) / n(),
+    Total_Tests = n(),
+    .groups = "drop"
+  ) %>%
+  filter(Total_Tests > 15)
+
+# Enforce explicit factor sorting for the legend
+plot_pirche_ratios$PIRCHE_Group <- factor(plot_pirche_ratios$PIRCHE_Group, levels = all_groups)
+
+# 4. Define an expanded 3-color palette (adding an intermediate color)
+# If 'pirche_orange' or similar is defined, use it, otherwise a neutral gray/orange bridge works well
+pirche_intermediate_color <- "#E69F00" 
+
+custom_palette <- setNames(
+  c(pirche_green, pirche_intermediate_color, pirche_purple), 
+  all_groups
+)
+
+# 5. Generate the Grouped Bar Plot (3 groups per timepoint)
+positivity_ratio_plot <- ggplot(plot_pirche_ratios, aes(x = assigned_month, y = Ratio, fill = PIRCHE_Group)) +
+  
+  geom_bar(
+    stat = "identity", 
+    position = position_dodge(width = 0.85), # Tweaked slightly to give 3 bars space to dodge
+    width = 0.8, 
+    alpha = 0.85
+  ) +
+  geom_text(
+    aes(
+      label = paste0("n = ", Total_Tests),
+      group = PIRCHE_Group 
+    ),
+    position = position_dodge(width = 0.85),
+    hjust = -0.2,           
+    vjust = 0.4,
+    angle = 90,             
+    size = 2.8,              # Sized down slightly so 3 stacked text elements fit cleanly
+    fontface = "bold",
+    color = "gray20"
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "Transient ddcfDNA Positivity Ratio by PIRCHE-T2 Tertiles",
+    subtitle = "Cohort divided into three equal-sized baseline immunological risk segments.",
+    x = "Time Post-Transplant (Months)",
+    y = "Positivity Ratio",
+    fill = "Immunological Risk Tertile"
+  ) +
+  
+  scale_x_continuous(breaks = target_months) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.25))) + # Extra ceiling padding
+  scale_fill_manual(values = custom_palette) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.minor.x = element_blank(),
+    legend.position = "top",
+    legend.text = element_text(size = 9)
+  )
+
+print(positivity_ratio_plot)
+ggsave(paste0(manuscript_root, "positivity_ratio_tertiles.png"), plot = positivity_ratio_plot, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+```
+
+```{r Create random event onset date}
+
+# 1. Extract the transition intervals from the longitudinal data
+transition_intervals <- transition_intervals_calc(cfdna_filtered)
+
+# 2. Generate the random event time within that specific window
+# Setting a seed ensures you get the exact same random numbers if you run the script again
+set.seed(4321)
+
+transition_intervals <- transition_intervals %>%
+  mutate(
+    # runif() generates random uniform numbers. It accepts vectors for min and max.
+    random_event_time = runif(n(), min = last_neg_time, max = first_pos_time)
+  )
+
+# 3. Merge the new 'random_event_time' back into the Core dataset
+core_filtered <- core_filtered %>%
+  left_join(
+    # Select only the ID and the new random date column to avoid cluttering Core
+    select(transition_intervals, patient_id, random_event_time),
+    by = "patient_id"
+  )
+
+# plot the event distribution
+ggplot(transition_intervals %>% filter(!is.nan(random_event_time))) +
+  
+  # Density of the Random Event Times
+  geom_density(
+    aes(x = random_event_time, fill = "Random Event Time"), 
+    alpha = 0.5, color = pirche_ocean_green, adjust = 0.25
+  ) +
+  
+  # Density of the First Positive Test (The upper bound)
+  geom_density(
+    aes(x = first_pos_time, fill = "First Positive Test"), 
+    alpha = 0.5, color = pirche_plum, adjust = 0.25
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "Random Event Time vs. First Positive Test",
+    x = "Time (Days)",
+    y = "Density",
+    fill = "Metric"
+  ) +
+  scale_fill_manual(values = c("Random Event Time" = pirche_summer_green, "First Positive Test" = pirche_cannon_pink)) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+cfdna_positivity_distribution <- ggplot(
+  transition_intervals %>% filter(!is.nan(random_event_time)), 
+  aes(x = random_event_time)
+) +
+  
+  # 1. Year-long relative histogram for Random Event Times
+  geom_histogram(
+    aes(y = after_stat(count / sum(count))),
+    binwidth = 365,
+    fill = pirche_summer_green,
+    color = "white",          # Clean white borders between years
+    alpha = 0.7,
+    boundary = 0              # Forces bins to start exactly at 0 (0-365, 365-730, etc.)
+  ) +
+  
+  # 2. Dynamic Text Labels showing percentages on top of each bar
+  stat_bin(
+    aes(
+      y = after_stat(count / sum(count)),
+      label = paste0(round(after_stat(count / sum(count)) * 100, 1), "%")
+    ),
+    binwidth = 365,
+    boundary = 0,
+    geom = "text",
+    vjust = -0.5,             # Pushes the text slightly above the top of the bar
+    fontface = "bold",
+    size = 3.5,
+    color = "gray15"
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "Annual Distribution of Simulated Event Onset Times",
+    subtitle = "Each bucket represents one year, y-axis shows the fraction of total events",
+    x = "Time Post-Transplant (Days)",
+    y = "Fraction of Cohort Events"
+  ) +
+  
+  # Set X-axis breaks to happen exactly at year markers (0, 365, 730, 1095...)
+  scale_x_continuous(
+    breaks = seq(0, max(transition_intervals$random_event_time, na.rm = TRUE) + 365, by = 365),
+    labels = function(x) paste0(x, "\n(Yr ", round(x / 365), ")")
+  ) +
+  
+  # Format the Y-axis as clean percentages and add padding at top so labels don't cut off
+  scale_y_continuous(
+    labels = scales::percent, 
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.minor.x = element_blank()
+  )
+
+# Output and save targets
+print(cfdna_positivity_distribution)
+ggsave(paste0(manuscript_root, supplement, "cfdna_positivity_time.png"), plot = cfdna_positivity_distribution, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+
+ggplot(cfdna_filtered %>% filter(!is.na(cfdna_time) & !is.na(type_cfdna)), 
+       aes(x = cfdna_time, y = after_stat(count), fill = as.character(as_factor(type_cfdna)), color = as.character(as_factor(type_cfdna)))) +
+  
+  # Smooth density curves scaled by absolute row counts
+  geom_density(alpha = 0.4, linewidth = 0.8, adjust = 0.5) +
+  
+  theme_minimal() +
+  labs(
+    title = "Surveillance Volume: Absolute Test Density over Time",
+    subtitle = "Y-axis shows the estimated number of tests performed per timepoint.",
+    x = "Time Post-Transplant (Days)",
+    y = "Number of Tests",
+    fill = "cfDNA Assay Type",
+    color = "cfDNA Assay Type"
+  ) +
+  
+  # Clean X-axis breaks (adjust max value based on your timeline)
+  scale_x_continuous(breaks = seq(0, max(cfdna_filtered$cfdna_time, na.rm = TRUE), by = 180)) +
+  
+  scale_color_manual(values = cfdna_vendors) +
+  scale_fill_manual(values = cfdna_vendors) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.minor.x = element_blank(),
+    legend.position = "top"
+  )
+
+library(tidyverse)
+
+# 1. Calculate the number of distinct cfDNA types per patient
+patient_type_variability <- cfdna_filtered %>%
+  filter(!is.na(type_cfdna)) %>%
+  group_by(patient_id) %>%
+  summarise(
+    distinct_types = n_distinct(type_cfdna),
+    total_tests = n(),
+    .groups = "drop"
+  ) %>%
+  # Count how many patients fall into each variability bucket
+  count(distinct_types, name = "patient_count") %>%
+  mutate(
+    fraction = patient_count / sum(patient_count),
+    label_pct = scales::percent(fraction, accuracy = 0.1)
+  )
+
+
+library(tidyverse)
+
+# 1. Calculate patient-level sorting metrics
+patient_order_metrics <- cfdna_filtered %>%
+  filter(!is.na(type_cfdna)) %>%
+  group_by(patient_id) %>%
+  summarise(
+    # Convert factor/labels to numeric to calculate a sorting "average"
+    avg_type = mean(as.numeric(type_cfdna), na.rm = TRUE),
+    total_tests = n(),
+    .groups = "drop"
+  )
+
+# 2. Join metrics back and reorder the patient factor levels
+plot_streak_data <- cfdna_filtered %>%
+  filter(!is.na(type_cfdna)) %>%
+  inner_join(patient_order_metrics, by = "patient_id") %>%
+  # Arrange the data by our target hierarchy (descending for both)
+  arrange(desc(avg_type), desc(total_tests)) %>%
+  # Freeze this order into the factor levels of patient_id
+  mutate(patient_id = fct_inorder(factor(patient_id)))
+
+# 3. Generate the Sorted Streak Plot
+streak_plot <- ggplot(plot_streak_data, aes(x = cfdna_time, y = patient_id, color = as.character(as_factor(type_cfdna)))) +
+  
+  # Shape = 124 represents the '|' vertical pipe symbol, creating a clean timeline tick
+  geom_point(size = 2, alpha = 0.8, shape = 124) + 
+  
+  theme_minimal() +
+  labs(
+    title = "Longitudinal Patient Surveillance Timelines by Assay Type",
+    subtitle = "Ordered by primary assay platform type, then by total testing volume (ascending)",
+    x = "Days Post-Transplant",
+    y = "Patients",
+    color = "Assay Platform"
+  ) +
+  
+  # Clean X-axis intervals
+  scale_x_continuous(breaks = seq(0, max(plot_streak_data$cfdna_time, na.rm = TRUE), by = 180)) +
+  scale_color_manual(values = cfdna_vendors) +
+  theme(
+    # Hiding individual patient IDs prevents text overlap when dealing with large cohorts
+    axis.text.y = element_blank(), 
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    legend.position = "top",
+    plot.title = element_text(face = "bold", size = 14)
+  )
+print(streak_plot)
+ggsave(paste0(manuscript_root, supplement, "cfdna_timepoints.png"), plot = streak_plot, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+
+library(tidyverse)
+
+# 1. Calculate unique vendor counts and their relative cohorts
+patient_vendor_summary <- cfdna_filtered %>%
+  filter(!is.na(type_cfdna)) %>%
+  group_by(patient_id) %>%
+  summarise(number_of_vendors = n_distinct(type_cfdna), .groups = "drop")
+
+# Calculate the precise proportions for text labeling
+proportion_labels <- patient_vendor_summary %>%
+  count(number_of_vendors) %>%
+  mutate(
+    fraction = n / sum(n),
+    label = paste0("N = ", n, "\n(", scales::percent(fraction, accuracy = 0.1), ")")
+  )
+
+# 2. Generate the Boxplot with Proportion Annotations
+ggplot(patient_vendor_summary, aes(x = "", y = number_of_vendors)) +
+  
+  # Base Boxplot constrained to the 1-3 metric space
+  geom_boxplot(
+    width = 0.3, 
+    fill = "#499F7E", 
+    alpha = 0.4, 
+    outlier.shape = NA
+  ) +
+  
+  # Symmetric jittered points to visually demonstrate the proportions
+  geom_jitter(
+    width = 0.12, 
+    height = 0.05, 
+    alpha = 0.5, 
+    color = "gray30", 
+    size = 2.5
+  ) +
+  
+  # Overlay the calculated proportions at each discrete vendor tier (1, 2, 3)
+  geom_text(
+    data = proportion_labels,
+    aes(x = 1.25, y = number_of_vendors, label = label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    fontface = "bold",
+    color = "gray15",
+    size = 3.8
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "Cohort Proportion vs. Vendor Diversity Breakdown",
+    subtitle = "Boxplot shows the structural distribution; side labels indicate exact patient proportions.",
+    x = NULL,
+    y = "Number of Unique cfDNA Vendors"
+  ) +
+  
+  # Strictly lock the axis mapping from 1 to 3
+  scale_y_continuous(breaks = 1:3, limits = c(0.6, 3.4)) +
+  
+  # Give the text labels breathing room on the right side
+  scale_x_discrete(expand = expansion(mult = c(0.5, 1.5))) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(face = "bold", size = 12),
+    axis.text.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+```
+
+```{r basic PIRCHE-T2 stats}
+summary(core_filtered %>% pull(PIRCHE_II))
+ggplot(data = core_filtered, aes(y = PIRCHE_II)) +
+        geom_boxplot(
+                fill=pirche_purple,
+                alpha = 0.7,
+                outlier.colour = "red",
+                outlier.alpha = 0.5
+        ) +
+          theme_minimal() +
+          labs(
+            title = "PIRCHE-T2 sum scores distribution",
+            x = NULL, # Hide the X-axis title since the labels are self-explanatory
+            y = "PIRCHE-T2"
+          ) +
+          theme(
+            legend.position = "none",
+            plot.title = element_text(face = "bold", size = 14),
+            strip.text = element_text(face = "bold", size = 11)
+          )
+```
+# Correlation of cfDNA with PIRCHE scores
+Just another sanity check, to confirm we're still in line with previous analyses of the Utah cohort.
+```{r Correlation of cfDNA and PIRCHE-T2}
+
+core_horizontal <- core_filtered %>%
+        # 1. Create the grouping variable (same as before)
+        mutate(
+                transition_group = if_else(
+                        patient_id %in% (transition_intervals %>% filter(!is.nan(random_event_time)) %>% pull(patient_id)),
+                        "Has Transition",  # Shortened slightly to fit better on the axis
+                        "No Transition"
+                )
+        ) %>%
+
+        # 2. Reshape the data from wide to long format
+        # This creates two new columns: 'PIRCHE_Type' and 'Score'
+        pivot_longer(
+                cols = c(PIRCHE_II, PIRCHE_II_A, PIRCHE_II_B, PIRCHE_II_C, PIRCHE_II_DRB1, PIRCHE_II_DQB1, PIRCHE_II_ClassII),
+                names_to = "PIRCHE_Type",
+                values_to = "Score"
+        ) %>%
+
+        # Remove missing scores to avoid ggplot warnings
+        filter(!is.na(Score))
+
+      core_horizontal %>%
+
+        # 3. Build the base boxplot
+        ggplot(aes(x = transition_group, y = Score, fill = transition_group)) +
+        geom_boxplot(
+                alpha = 0.7,
+                outlier.colour = "red",
+                outlier.alpha = 0.5
+        ) +
+
+        # 4. Facet the plot into 6 distinct panels based on the PIRCHE_Type
+        facet_wrap(~ PIRCHE_Type, scales = "free_y", ncol = 4, nrow=2) +
+
+        # 5. Add the p-value calculation to every individual facet
+        stat_compare_means(
+                method = "wilcox.test",
+                label = "p.format",
+                vjust = -0.5
+        ) +
+
+        # Expand the Y-axis slightly so the p-values don't get cut off by the top border
+        scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+        scale_fill_manual(values=rev(pirche_primary_one_colors)) +
+        # 6. Formatting and themes
+        theme_minimal() +
+        labs(
+                title = "PIRCHE Sub-scores by cfDNA Transition Status",
+                x = NULL, # Hide the X-axis title since the labels are self-explanatory
+                y = "Calculated Score"
+        ) +
+        theme(
+                legend.position = "none",
+                plot.title = element_text(face = "bold", size = 14),
+                strip.text = element_text(face = "bold", size = 11), # Makes the panel titles (e.g., PIRCHE_II_A) bold
+                axis.text.x = element_text(angle = 45, hjust = 1)    # Tilts the x-axis text so it doesn't overlap
+        )
+library(writexl)
+
+# Save the long-format data frame to an Excel file
+write_xlsx(core_horizontal, path = "/Users/pir-mn/Library/CloudStorage/GoogleDrive-matthias.niemann@pirche.com/Geteilte Ablagen/PIR Bioinformatic Resources/Utah TTE/output/transition_vs_pirche.xlsx")
+```
+
+```{r Kaplan Meier raw data}
+library(survival)
+library(survminer)
+
+# 1. Calculate clinical event times for the full strategy
+transition_intervals_full <- transition_intervals_calc(cfdna_filtered, keep_all_patients = TRUE)
+
+all_groups <- c(low_pirche_label, high_pirche_label)
+
+# 2. Enrich the event data with the baseline PIRCHE scores
+km_data <- transition_intervals_full %>%
+  left_join(
+    core_filtered %>% select(patient_id, PIRCHE_II), 
+    by = "patient_id"
+  ) %>%
+  filter(!is.na(PIRCHE_II)) %>%
+  
+  # --- REVERTED: Binary risk stratification ---
+  mutate(
+    Risk_Group = if_else(PIRCHE_II < pirche_cutoff, low_pirche_label, high_pirche_label),
+    
+    # Define Survival Metrics
+    Time_to_Event = if_else(!is.nan(first_pos_time), first_pos_time / days_per_month, observation_time / days_per_month),
+    Event_Status  = if_else(!is.nan(first_pos_time), 1, 0)
+  )
+
+# Enforce clean factor ordering for the plot legend
+km_data$Risk_Group <- factor(km_data$Risk_Group, levels = all_groups)
+
+# 3. Fit the Kaplan-Meier Survival Model
+km_fit <- survfit(Surv(Time_to_Event, Event_Status) ~ Risk_Group, data = km_data)
+
+# 4. Generate the Kaplan-Meier Plot with Risk Table
+km_plot <- ggsurvplot(
+  km_fit,
+  data = km_data,
+  palette = c(pirche_green, pirche_purple), 
+  
+  # Keeps the active risk table fixes intact
+  risk.table = TRUE,                         
+  
+  pval = TRUE,                               
+  pval.method = TRUE,
+  #log.rank.weights = "n",                    # "n" weights by the number of subjects at risk (Gehan-Breslow style)
+  conf.int = TRUE,                           
+  xlim = c(0, observation_time / days_per_month),                          
+  break.time.by = 3,                        
+  
+  # Titles and Label Formatting
+  title = "Time to de novo ddcfDNA Positivity by PIRCHE-T2",
+  #subtitle = paste0("Stratified by PIRCHE-T2"),
+  xlab = "Months Post-Transplant",
+  ylab = "Probability of Remaining Transition-Free",
+  legend.title = "Risk Cohort",
+  legend.labs = all_groups,
+  
+  # Clean Aesthetics
+  ggtheme = theme_minimal(),
+  tables.theme = theme_cleantable()
+)
+
+# Render the combined plot and risk table grid together
+print(km_plot)
+res <- arrange_ggsurvplots(list(km_plot), print = FALSE, ncol = 1, nrow = 1)
+ggsave(paste0(manuscript_root, "km_baseline.png"), plot = res, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+# 1. Extract the Kaplan-Meier summary specifically at month 36
+km_summary_3yr <- summary(km_fit, times = 36)
+
+# 2. Build a clean dataframe showing the cumulative incidence per group
+incidence_3yr_table <- tibble(
+  Risk_Group = gsub("Risk_Group=", "", km_summary_3yr$strata),
+  Survival_Prob = km_summary_3yr$surv,
+  
+  # Cumulative Incidence = 1 - Survival
+  Incidence_Raw = 1 - Survival_Prob,
+  Incidence_Pct = scales::percent(Incidence_Raw, accuracy = 0.1),
+  
+  # Confidence Intervals for the incidence
+  Lower_CI = scales::percent(1 - km_summary_3yr$upper, accuracy = 0.1), # Note upper/lower invert when subtracting from 1
+  Upper_CI = scales::percent(1 - km_summary_3yr$lower, accuracy = 0.1)
+)
+
+# 3. Print the results cleanly to your console
+cat("\n=== Cumulative Incidence at 3 Years (36 Months) ===\n")
+print(incidence_3yr_table)
+```
+
+# Temporal alignment and emulated longitudinal trajectories
+In order to horizontally line up the samples by date, we apply time-binning by finding the closest target month considering the absolute time difference between sample date and any of the scheduled time points.
+
+## Continuous cfDNA value
+```{r Thinning}
+############################# create emulated reduced trajectories ###################################
+
+# 2. Filter to keep ONLY tests that were mapped to the reduced schedule or are last in sequence
+cfdna_thinned <- cfdna_filtered %>%
+  # Group by patient to evaluate the "last sample" on an individual basis
+  group_by(patient_id) %>%
+  
+  # Keep the row if it's in the reduced schedule OR if it's the max month for this patient
+  filter(
+    (assigned_month %in% reduced_months) 
+    #| 
+    #(assigned_month == max(assigned_month, na.rm = TRUE))
+  ) %>%
+  ungroup()
+
+cfdna_personalized <- bind_rows(cfdna_filtered %>% filter(PIRCHE_II >= pirche_cutoff), cfdna_thinned %>% filter(PIRCHE_II < pirche_cutoff))
+
+# 1. Extract the transition intervals from the longitudinal data
+transition_intervals_thinned <- transition_intervals_calc(cfdna_thinned)
+transition_intervals_personalized <- transition_intervals_calc(cfdna_personalized)
+
+
+################### longitudinal time-warped cfDNA trajectories ###########################
+longitudinal_full <- spaghetti_plot(cfdna_filtered, "High Frequency")
+longitudinal_personalized <- spaghetti_plot(cfdna_personalized, "Personalized Frequency")
+longitudinal_thinned <- spaghetti_plot(cfdna_thinned, "Low Frequency")
+print(longitudinal_full)
+print(longitudinal_personalized)
+print(longitudinal_thinned)
+```
+
+## Categorical cfDNA based on positivity rules
+Converting cfDNA trajectories here to binary as a sanity check. We need to consider treatment bias (i.e. "because a cfDNA was high, clinicians started treatment, which reduced cfDNA levels in the next sample")! As such, when thinning the tests, we may miss the transient positive cfDNA test. To account for that, we model in the original data, that once a cfDNA becomes positive, all subsequent tests are also positive. This doesn't hurt our feelings, as our observed variable is time-to-(first)-detection. As such, we expect here only low-to-high transitions (i.e. diagonals from bottom left to top right), but no high-to-low transitions.
+
+Could also consider to transition patients to high frequency arm, once they get positive (which would increase test numbers a bit, but adds complexity - in a real RCT, that would be realistic behavior though!?)
+
+```{r Plot categorical cfDNA trajectories}
+################### longitudinal time-warped cfDNA trajectories ###########################
+longitudinal_full_categorical <- spaghetti_plot_categorical(cfdna_filtered, "High Frequency")
+longitudinal_personalized_categorical <- spaghetti_plot_categorical(cfdna_personalized, "Personalized Frequency")
+longitudinal_thinned_categorical <- spaghetti_plot_categorical(cfdna_thinned, "Low Frequency")
+print(longitudinal_full_categorical)
+print(longitudinal_personalized_categorical)
+print(longitudinal_thinned_categorical)
+```
+
+
+
+```{r Kaplan Meier of personalized schema}
+library(survival)
+library(survminer)
+
+# 1. Calculate clinical event times for the full strategy
+transition_intervals_pers <- transition_intervals_calc(cfdna_personalized, keep_all_patients = TRUE)
+transition_intervals_full <- transition_intervals_calc(cfdna_filtered, keep_all_patients = TRUE)
+transition_intervals_thinned <- transition_intervals_calc(cfdna_thinned, keep_all_patients = TRUE)
+
+all_groups <- c(low_pirche_label, high_pirche_label)
+
+# 2. Enrich the event data with the baseline PIRCHE scores
+km_data <- transition_intervals_pers %>%
+  left_join(
+    core_filtered %>% select(patient_id, PIRCHE_II), 
+    by = "patient_id"
+  ) %>%
+  filter(!is.na(PIRCHE_II)) %>%
+  
+  # --- REVERTED: Binary risk stratification ---
+  mutate(
+    Risk_Group = if_else(PIRCHE_II < pirche_cutoff, low_pirche_label, high_pirche_label),
+    
+    # Define Survival Metrics
+    Time_to_Event = if_else(!is.nan(first_pos_time), first_pos_time / days_per_month, observation_time / days_per_month),
+    Event_Status  = if_else(!is.nan(first_pos_time), 1, 0)
+  )
+
+# Enforce clean factor ordering for the plot legend
+km_data$Risk_Group <- factor(km_data$Risk_Group, levels = all_groups)
+
+# 3. Fit the Kaplan-Meier Survival Model
+km_fit <- survfit(Surv(Time_to_Event, Event_Status) ~ Risk_Group, data = km_data)
+
+# 4. Generate the Kaplan-Meier Plot with Risk Table
+km_plot <- ggsurvplot(
+  km_fit,
+  data = km_data,
+  # --- REVERTED: Back to your primary 2-color branding ---
+  palette = c(pirche_green, pirche_purple), 
+  
+  # Keeps the active risk table fixes intact
+  risk.table = TRUE,                         
+  
+  pval = TRUE,                               
+  pval.method = TRUE,   
+  #log.rank.weights = "n",                    # "n" weights by the number of subjects at risk (Gehan-Breslow style)
+  
+  conf.int = TRUE,                           
+  xlim = c(0, observation_time / days_per_month),                          
+  break.time.by = 3,                        
+  
+  # Titles and Label Formatting
+  title = "Time to de novo cfDNA Positivity by PIRCHE-T2 Risk",
+  subtitle = paste0("Reduced monitoring frequency for low PIRCHE-T2. (PF)"),
+  xlab = "Months Post-Transplant",
+  ylab = "Probability of Remaining Transition-Free",
+  legend.title = "Risk Cohort",
+  legend.labs = all_groups,
+  
+  # Clean Aesthetics
+  ggtheme = theme_minimal() + theme(plot.title = element_text(face = "bold", size = 14)),
+  tables.theme = theme_cleantable()
+)
+
+# Render the combined plot and risk table grid together
+print(km_plot)
+```
+```{r Compare schedules by Kaplan Meier for low risk patients}
+library(survival)
+library(survminer)
+
+# 1. Prepare and filter both datasets for Low PIRCHE patients only
+km_original_low <- transition_intervals_full %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II < pirche_cutoff) %>%
+  mutate(Strategy = "Extended Frequency (EF)")
+
+km_personalized_low <- transition_intervals_thinned %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II < pirche_cutoff) %>%
+  mutate(Strategy = "Standard Frequency (SF)")
+
+# 2. Combine the datasets and construct survival metrics
+km_comparison_data <- bind_rows(km_original_low, km_personalized_low) %>%
+  mutate(
+    Time_to_Event = if_else(!is.nan(first_pos_time), first_pos_time / days_per_month, observation_time / days_per_month),
+    Event_Status  = if_else(!is.nan(first_pos_time), 1, 0),
+    Strategy      = factor(Strategy, levels = c("Extended Frequency (EF)", "Standard Frequency (SF)"))
+  )
+
+# 3. Fit the Kaplan-Meier Model comparing the two strategies
+km_strategy_fit <- survfit(Surv(Time_to_Event, Event_Status) ~ Strategy, data = km_comparison_data)
+
+# 4. Generate the Kaplan-Meier Plot
+km_strategy_plot <- ggsurvplot(
+  km_strategy_fit,
+  data = km_comparison_data,
+  # Custom palette matching your low PIRCHE green alongside a neutral comparison shade
+  palette = c(pirche_ocean_green, pirche_teal), 
+  
+  risk.table = TRUE,                         
+  pval = TRUE,                               
+  pval.method = TRUE,                        # Will now print "Wilcoxon" or "Peto-Peto" next to the value
+  #log.rank.weights = "n",                    # "n" weights by the number of subjects at risk (Gehan-Breslow style)
+  
+  conf.int = TRUE,                           
+  xlim = c(0, observation_time / days_per_month),                          
+  break.time.by = 3,                        
+  
+  # Titles and Label Formatting
+  title = paste0("Surveillance Frequency Comparison in Low PIRCHE-T2 Cohort (<", pirche_cutoff, ")"),
+  subtitle = "Comparing time to de novo cfDNA positivity detection between schedules.",
+  xlab = "Months Post-Transplant",
+  ylab = "Probability of Remaining Transition-Free",
+  legend.title = "Surveillance Frequency",
+  legend.labs = c("Extended (EF)", "Standard (SF)"),
+  
+  ggtheme = theme_minimal() + theme(plot.title = element_text(face = "bold", size = 14)),
+  tables.theme = theme_cleantable()
+)
+
+# Render the final comparison grid
+print(km_strategy_plot)
+res <- arrange_ggsurvplots(list(km_strategy_plot), print = FALSE, ncol = 1, nrow = 1)
+ggsave(paste0(manuscript_root, supplement, "km_pirche_low.png"), plot = res, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+```
+```{r Compare schedules by Kaplan Meier for high risk patients}
+library(survival)
+library(survminer)
+
+# 1. Prepare and filter both datasets for Low PIRCHE patients only
+km_original_high <- transition_intervals_full %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II >= pirche_cutoff) %>%
+  mutate(Strategy = "Extended Frequency (EF)")
+
+km_thinned_high <- transition_intervals_thinned %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II >= pirche_cutoff) %>%
+  mutate(Strategy = "Standard Frequency (SF)")
+
+# 2. Combine the datasets and construct survival metrics
+km_comparison_data <- bind_rows(km_original_high, km_thinned_high) %>%
+  mutate(
+    Time_to_Event = if_else(!is.nan(first_pos_time), first_pos_time / days_per_month, observation_time / days_per_month),
+    Event_Status  = if_else(!is.nan(first_pos_time), 1, 0),
+    Strategy      = factor(Strategy, levels = c("Extended Frequency (EF)", "Standard Frequency (SF)"))
+  )
+
+# 3. Fit the Kaplan-Meier Model comparing the two strategies
+km_strategy_fit <- survfit(Surv(Time_to_Event, Event_Status) ~ Strategy, data = km_comparison_data)
+
+# 4. Generate the Kaplan-Meier Plot
+km_strategy_plot <- ggsurvplot(
+  km_strategy_fit,
+  data = km_comparison_data,
+  # Custom palette matching your low PIRCHE green alongside a neutral comparison shade
+  palette = c(pirche_plum, pirche_dark_plum), 
+  
+  risk.table = TRUE,                         
+  pval = TRUE,                               
+  pval.method = TRUE,           
+  #log.rank.weights = "n",                    # "n" weights by the number of subjects at risk (Gehan-Breslow style)
+  
+  conf.int = TRUE,                           
+  xlim = c(0, observation_time / days_per_month),                          
+  break.time.by = 3,                        
+  
+  # Titles and Label Formatting
+  title = paste0("Surveillance Frequency Comparison in High PIRCHE-T2 Cohort (>=", pirche_cutoff, ")"),
+  subtitle = "Comparing time to de novo cfDNA positivity detection between schedules.",
+  xlab = "Months Post-Transplant",
+  ylab = "Probability of Remaining Transition-Free",
+  legend.title = "Surveillance Frequency",
+  legend.labs = c("Extended (EF)", "Standard (SF)"),
+  
+  ggtheme = theme_minimal() + theme(plot.title = element_text(face = "bold", size = 14)),
+  tables.theme = theme_cleantable()
+)
+
+# Render the final comparison grid
+print(km_strategy_plot)
+res <- arrange_ggsurvplots(list(km_strategy_plot), print = FALSE, ncol = 1, nrow = 1)
+ggsave(paste0(manuscript_root, supplement, "km_pirche_high.png"), plot = res, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+```
+```{r Compare schedules by Kaplan Meier for high risk EVENT patients}
+library(survival)
+library(survminer)
+
+
+patients_with_one_pos <- cfdna_filtered %>%
+  filter(!is.na(positivity)) %>%
+  group_by(patient_id) %>%
+  summarise(total_positives = sum(positivity == 1), .groups = "drop") %>%
+  filter(total_positives > 0) %>%
+  pull(patient_id)
+
+# 1. Prepare and filter both datasets for Low PIRCHE patients only
+km_original_low <- transition_intervals_full %>%
+  filter(patient_id %in% patients_with_one_pos) %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II < pirche_cutoff) %>%
+  mutate(Strategy = "Extended Frequency (EF)")
+
+km_thinned_low <- transition_intervals_thinned %>%
+  filter(patient_id %in% patients_with_one_pos) %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II < pirche_cutoff) %>%
+  mutate(Strategy = "Standard Frequency (SF)")
+
+# 2. Combine the datasets and construct survival metrics
+km_comparison_data <- bind_rows(km_original_low, km_thinned_low) %>%
+  mutate(
+    Time_to_Event = if_else(!is.nan(first_pos_time), first_pos_time / days_per_month, observation_time / days_per_month),
+    Event_Status  = if_else(!is.nan(first_pos_time), 1, 0),
+    Strategy      = factor(Strategy, levels = c("Extended Frequency (EF)", "Standard Frequency (SF)"))
+  )
+
+# 3. Fit the Kaplan-Meier Model comparing the two strategies
+km_strategy_fit <- survfit(Surv(Time_to_Event, Event_Status) ~ Strategy, data = km_comparison_data)
+
+# 4. Generate the Kaplan-Meier Plot
+km_strategy_plot_low <- ggsurvplot(
+  km_strategy_fit,
+  data = km_comparison_data,
+  # Custom palette matching your low PIRCHE green alongside a neutral comparison shade
+  palette = c(pirche_plum, pirche_dark_plum), 
+  
+  risk.table = TRUE,                         
+  pval = TRUE,                               
+  pval.method = TRUE,           
+  #log.rank.weights = "n",                    # "n" weights by the number of subjects at risk (Gehan-Breslow style)
+  
+  conf.int = TRUE,                           
+  xlim = c(0, observation_time / days_per_month),                          
+  break.time.by = 3,                        
+  
+  # Titles and Label Formatting
+  title = paste0("Surveillance Frequency Comparison in Low PIRCHE-T2 Cohort (<", pirche_cutoff, ")"),
+  subtitle = "Comparing time to de novo cfDNA positivity detection between schedules.",
+  xlab = "Months Post-Transplant",
+  ylab = "Probability of Remaining Transition-Free",
+  legend.title = "Surveillance Frequency",
+  legend.labs = c("Extended (EF)", "Standard (SF)"),
+  
+  ggtheme = theme_minimal() + theme(plot.title = element_text(face = "bold", size = 14)),
+  tables.theme = theme_cleantable()
+)
+
+# Render the final comparison grid
+print(km_strategy_plot_low)
+
+# 1. Prepare and filter both datasets for Low PIRCHE patients only
+km_original_high <- transition_intervals_full %>%
+  filter(patient_id %in% patients_with_one_pos) %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II >= pirche_cutoff) %>%
+  mutate(Strategy = "Extended Frequency (EF)")
+
+km_thinned_high <- transition_intervals_thinned %>%
+  filter(patient_id %in% patients_with_one_pos) %>%
+  left_join(core_filtered %>% select(patient_id, PIRCHE_II), by = "patient_id") %>%
+  filter(PIRCHE_II >= pirche_cutoff) %>%
+  mutate(Strategy = "Standard Frequency (SF)")
+
+# 2. Combine the datasets and construct survival metrics
+km_comparison_data <- bind_rows(km_original_high, km_thinned_high) %>%
+  mutate(
+    Time_to_Event = if_else(!is.nan(first_pos_time), first_pos_time / days_per_month, observation_time / days_per_month),
+    Event_Status  = if_else(!is.nan(first_pos_time), 1, 0),
+    Strategy      = factor(Strategy, levels = c("Extended Frequency (EF)", "Standard Frequency (SF)"))
+  )
+
+# 3. Fit the Kaplan-Meier Model comparing the two strategies
+km_strategy_fit <- survfit(Surv(Time_to_Event, Event_Status) ~ Strategy, data = km_comparison_data)
+
+# 4. Generate the Kaplan-Meier Plot
+km_strategy_plot_high <- ggsurvplot(
+  km_strategy_fit,
+  data = km_comparison_data,
+  # Custom palette matching your low PIRCHE green alongside a neutral comparison shade
+  palette = c(pirche_plum, pirche_dark_plum), 
+  
+  risk.table = TRUE,                         
+  pval = TRUE,                               
+  pval.method = TRUE,           
+  #log.rank.weights = "n",                    # "n" weights by the number of subjects at risk (Gehan-Breslow style)
+  
+  conf.int = TRUE,                           
+  xlim = c(0, observation_time / days_per_month),                          
+  break.time.by = 3,                        
+  
+  # Titles and Label Formatting
+  title = paste0("Surveillance Frequency Comparison in High PIRCHE-T2 Cohort (>=", pirche_cutoff, ")"),
+  subtitle = "Comparing time to de novo cfDNA positivity detection between schedules.",
+  xlab = "Months Post-Transplant",
+  ylab = "Probability of Remaining Transition-Free",
+  legend.title = "Surveillance Frequency",
+  legend.labs = c("Extended (EF)", "Standard (SF)"),
+  
+  ggtheme = theme_minimal() + theme(plot.title = element_text(face = "bold", size = 14)),
+  tables.theme = theme_cleantable()
+)
+
+# Render the final comparison grid
+print(km_strategy_plot_high)
+```
+Depending on PIRCHE cutoffs, more patients are put into high or low risk groups and monitored accordingly. We want to find a sweet spot here. Testing a couple interesting points (PIRCHE quartiles, and 100, just for the sake of it). Given our onset date of rejection is simulated, we repeat the process with different random initialization. 
+
+Baselines are one-size-fits-all frequent and infrequent monitoring. Additionally, we emulate a 50%-powered random control arm in the study that gets infrequent cfDNA testing as a reference (black symbols).
+
+```{r Simulate Cutoffs and Random Seeds}
+# 1. Define simulation parameters
+
+pirche_cutoffs <- c(23, 45, 50, 69)
+random_seeds <- 1:1000
+patient_level_results_list <- list() # Extracted container for downstream processing
+
+# 2. Prepare the static baseline and thinned intervals
+base_intervals <- transition_intervals
+
+df_thin <- transition_intervals_thinned %>%
+  select(patient_id, first_pos_time.thin = first_pos_time)
+
+# extract cases with positivity event
+emulation_cfdna_filtered <- cfdna_filtered
+emulation_cfdna_thinned <- cfdna_thinned
+
+# Calculate the absolute min and max testing burden globally
+n_tests_full <- nrow(emulation_cfdna_filtered)
+n_tests_thin <- nrow(emulation_cfdna_thinned)
+rel_tests_full <- (n_tests_full / n_tests_thin) * 100
+rel_tests_thin <- 100
+
+# Pre-calculate the exact number of tests PER PATIENT across the ENTIRE cohort
+patient_test_counts <- emulation_cfdna_filtered %>%
+  count(patient_id, name = "n_full") %>%
+  left_join(
+    emulation_cfdna_thinned %>% count(patient_id, name = "n_thin"),
+    by = "patient_id"
+  ) %>%
+  mutate(n_thin = coalesce(n_thin, 0))
+
+# Get the list of ALL unique patients for the control group coin-toss
+all_patients <- patient_test_counts$patient_id
+
+# Pre-calculate personalized configurations to save processing time
+pers_configs <- list()
+for (cutoff in pirche_cutoffs) {
+  cfdna_pers <- bind_rows(emulation_cfdna_filtered %>% filter(PIRCHE_II >= cutoff), emulation_cfdna_thinned %>% filter(PIRCHE_II < cutoff))
+
+  intervals_pers <- transition_intervals_calc(cfdna_pers) %>%
+    select(patient_id, first_pos_time.pers = first_pos_time)
+
+  n_tests_pers <- nrow(cfdna_pers)
+
+  pers_configs[[as.character(cutoff)]] <- list(
+    intervals = intervals_pers,
+    n_tests = n_tests_pers,
+    rel_tests = (n_tests_pers / n_tests_thin) * 100
+  )
+}
+
+sim_results_list <- list()
+
+# 3. Run the simulation across seeds
+for (s in random_seeds) {
+  set.seed(s)
+  seed_patient_rows <- list()
+  # A. Generate the random event times for this seed
+  current_base <- base_intervals %>%
+    mutate(random_event_time = runif(n(), min = last_neg_time, max = first_pos_time)) %>%
+    select(patient_id, random_event_time, first_pos_time.full = first_pos_time)
+
+  # Calculate TTD for both Baselines
+  merged_base <- current_base %>%
+    inner_join(df_thin, by = "patient_id") %>%
+    mutate(
+      ttd_full = first_pos_time.full - random_event_time,
+      ttd_thin = first_pos_time.thin - random_event_time
+    ) %>%
+    filter(ttd_thin >= 0, ttd_full >= 0)
+
+  med_full <- mean(merged_base$ttd_full, na.rm = TRUE)
+  med_thin <- mean(merged_base$ttd_thin, na.rm = TRUE)
+
+  rel_delay_full <- (med_full / med_thin) * 100
+  rel_delay_thin <- 100
+
+  # Store High Frequency Simulation (Both Relative and Absolute)
+  sim_results_list[[length(sim_results_list) + 1]] <- tibble(
+    Strategy = "EF",
+    Seed = s,
+    Relative_Tests = rel_tests_full,
+    Relative_Delay = rel_delay_full,
+    Absolute_Tests = n_tests_full,
+    Absolute_Delay = med_full,
+    n = nrow(merged_base)
+  )
+  # Append EF Patient-Level Data
+  seed_patient_rows[[length(seed_patient_rows) + 1]] <- merged_base %>%
+    select(patient_id, random_event_time, TTD = ttd_full) %>%
+    mutate(Strategy = "EF", Seed = s)
+
+  # Store Low Frequency Simulation (Both Relative and Absolute)
+  sim_results_list[[length(sim_results_list) + 1]] <- tibble(
+    Strategy = "SF",
+    Seed = s,
+    Relative_Tests = rel_tests_thin,
+    Relative_Delay = rel_delay_thin,
+    Absolute_Tests = n_tests_thin,
+    Absolute_Delay = med_thin,
+    n = nrow(merged_base)
+  )
+  
+  # Append SF Patient-Level Data
+  seed_patient_rows[[length(seed_patient_rows) + 1]] <- merged_base %>%
+    select(patient_id, random_event_time, TTD = ttd_thin) %>%
+    mutate(Strategy = "SF", Seed = s)
+
+  # B. Calculate Random 1:2 Control Strategy
+  high_freq_patients <- sample(all_patients, size = floor(2/3.*length(all_patients)))
+
+  tests_control <- sum(patient_test_counts$n_full[patient_test_counts$patient_id %in% high_freq_patients]) +
+    sum(patient_test_counts$n_thin[patient_test_counts$patient_id %in% all_patients & !(patient_test_counts$patient_id %in% high_freq_patients)])
+
+  rel_tests_control <- (tests_control / n_tests_thin) * 100
+
+  merged_control <- merged_base %>%
+    mutate(
+      ttd_control = if_else(patient_id %in% high_freq_patients, ttd_full, ttd_thin)
+    )
+
+  med_control <- mean(merged_control$ttd_control, na.rm = TRUE)
+  rel_delay_control <- (med_control / med_thin) * 100
+
+  sim_results_list[[length(sim_results_list) + 1]] <- tibble(
+    Strategy = "RC 1:2",
+    Seed = s,
+    Relative_Tests = rel_tests_control,
+    Relative_Delay = rel_delay_control,
+    Absolute_Tests = tests_control,
+    Absolute_Delay = med_control,
+    n = nrow(merged_control)
+  )
+  
+  # Append RC Patient-Level Data
+  seed_patient_rows[[length(seed_patient_rows) + 1]] <- merged_control %>%
+    select(patient_id, random_event_time, TTD = ttd_control) %>%
+    mutate(Strategy = "RC 1:2", Seed = s)
+
+  # C. Calculate Personalized TTDs for each cutoff
+  for (cutoff in pirche_cutoffs) {
+    config <- pers_configs[[as.character(cutoff)]]
+
+    merged_pers <- merged_base %>%
+      inner_join(config$intervals, by = "patient_id") %>%
+      mutate(ttd_pers = first_pos_time.pers - random_event_time) %>%
+      filter(ttd_pers >= 0)
+
+    med_pers <- mean(merged_pers$ttd_pers, na.rm = TRUE)
+    rel_delay_pers <- (med_pers / med_thin) * 100
+
+    sim_results_list[[length(sim_results_list) + 1]] <- tibble(
+      Strategy = paste0("PF (T2 ≥ ", cutoff, ")"),
+      Seed = s,
+      Relative_Tests = config$rel_tests,
+      Relative_Delay = rel_delay_pers,
+      Absolute_Tests = config$n_tests,
+      Absolute_Delay = med_pers,
+      n = nrow(merged_pers)
+    )
+    
+    # Append PF Patient-Level Data
+    seed_patient_rows[[length(seed_patient_rows) + 1]] <- merged_pers %>%
+      select(patient_id, random_event_time, TTD = ttd_pers) %>%
+      mutate(Strategy = paste0("PF (T2 ≥ ", cutoff, ")"), Seed = s)
+  }
+  
+  patient_level_results_list[[s]] <- bind_rows(seed_patient_rows)
+}
+
+sim_results <- bind_rows(sim_results_list)
+patient_level_results <- bind_rows(patient_level_results_list)
+```
+
+```{r plot efficiency}
+# 4. Calculate Medians AND Error Bounds (Interquartile Range) for Both
+seed_level_summary <- sim_results %>%
+  group_by(Strategy, Seed) %>%
+  summarise(
+    # Get the unique or average baseline score for this specific seed run
+    Relative_Delay = mean(Relative_Delay, na.rm = TRUE),
+    Relative_Tests = mean(Relative_Tests, na.rm = TRUE),
+    Absolute_Delay = mean(Absolute_Delay, na.rm = TRUE),
+    Absolute_Tests = mean(Absolute_Tests, na.rm = TRUE),
+    n              = sum(n, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- ROUND 2: Squash across the Seeds ---
+summary_results <- seed_level_summary %>%
+  group_by(Strategy) %>%
+  summarise(
+    # Relative Summaries (Squashing the 1,000 seeds)
+    Med_Rel_Delay  = median(Relative_Delay, na.rm = TRUE),
+    Low_Rel_Delay  = quantile(Relative_Delay, 0.25, na.rm = TRUE),
+    High_Rel_Delay = quantile(Relative_Delay, 0.75, na.rm = TRUE),
+    
+    Med_Rel_Tests  = median(Relative_Tests, na.rm = TRUE),
+    Low_Rel_Tests  = quantile(Relative_Tests, 0.25, na.rm = TRUE),
+    High_Rel_Tests = quantile(Relative_Tests, 0.75, na.rm = TRUE),
+
+    # Absolute Summaries (Squashing the 1,000 seeds)
+    Med_Abs_Delay  = median(Absolute_Delay, na.rm = TRUE),
+    Low_Abs_Delay  = quantile(Absolute_Delay, 0.25, na.rm = TRUE),
+    High_Abs_Delay = quantile(Absolute_Delay, 0.75, na.rm = TRUE),
+    
+    Med_Abs_Tests  = median(Absolute_Tests, na.rm = TRUE),
+    Low_Abs_Tests  = quantile(Absolute_Tests, 0.25, na.rm = TRUE),
+    High_Abs_Tests = quantile(Absolute_Tests, 0.75, na.rm = TRUE),
+
+    # Expected patient cohort size across all iterations
+    n = mean(n, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Calculate slope and intercept for the RELATIVE infinite line
+med_high_rel_x <- summary_results$Med_Rel_Delay[summary_results$Strategy == "EF"]
+med_high_rel_y <- summary_results$Med_Rel_Tests[summary_results$Strategy == "EF"]
+med_low_rel_x <- summary_results$Med_Rel_Delay[summary_results$Strategy == "SF"]
+med_low_rel_y <- summary_results$Med_Rel_Tests[summary_results$Strategy == "SF"]
+
+tradeoff_slope_rel <- (med_low_rel_y - med_high_rel_y) / (med_low_rel_x - med_high_rel_x)
+tradeoff_intercept_rel <- med_high_rel_y - tradeoff_slope_rel * med_high_rel_x
+
+# Calculate slope and intercept for the ABSOLUTE infinite line
+med_high_abs_x <- summary_results$Med_Abs_Delay[summary_results$Strategy == "EF"]
+med_high_abs_y <- summary_results$Med_Abs_Tests[summary_results$Strategy == "EF"]
+med_low_abs_x <- summary_results$Med_Abs_Delay[summary_results$Strategy == "SF"]
+med_low_abs_y <- summary_results$Med_Abs_Tests[summary_results$Strategy == "SF"]
+
+med_n <- mean(summary_results$n)
+
+tradeoff_slope_abs <- (med_low_abs_y - med_high_abs_y) / (med_low_abs_x - med_high_abs_x)
+tradeoff_intercept_abs <- med_high_abs_y - tradeoff_slope_abs * med_high_abs_x
+
+# 5. Define Strategy Styling
+strategy_colors <- c(
+  "PF (T2 ≥ 23)" = pirche_gradient_11[1],
+  "PF (T2 ≥ 45)" = pirche_gradient_11[5],
+  "PF (T2 ≥ 50)" = pirche_gradient_11[8],
+  "PF (T2 ≥ 69)" = pirche_gradient_11[11],
+  "RC 1:2" = "black",
+  "EF" = "black",
+  "SF" = "black"
+)
+
+strategy_shapes <- c(
+  "PF (T2 ≥ 23)" = 16,
+  "PF (T2 ≥ 45)" = 16,
+  "PF (T2 ≥ 50)" = 16,
+  "PF (T2 ≥ 69)" = 16,
+  "RC 1:2" = 18,
+  "EF" = 17,
+  "SF" = 15
+)
+
+desired_strategy_order <- c("SF", "EF", "RC 1:2", "PF (T2 ≥ 23)", "PF (T2 ≥ 45)", "PF (T2 ≥ 50)", "PF (T2 ≥ 69)")
+
+tick_relative_y <- 4
+tick_relative_x <- 1.5
+tick_absolute_y <- 60
+tick_absolute_x <- 1.5
+
+summary_results_ordered <- summary_results %>%
+  mutate(Strategy = factor(Strategy, levels = desired_strategy_order))
+
+# 6a. Generate the RELATIVE Scatter Plot
+plot_relative <- ggplot(summary_results, aes(x = Med_Rel_Delay, y = Med_Rel_Tests, color = Strategy, shape = Strategy)) +
+  geom_abline(slope = tradeoff_slope_rel, intercept = tradeoff_intercept_rel, linetype = "dashed", color = "darkgray", linewidth = 0.8) +
+  geom_errorbar(aes(xmin = Low_Rel_Delay, xmax = High_Rel_Delay), alpha = 0.6, width=tick_relative_y, linewidth = 0.8, orientation = "y") +
+  geom_errorbar(aes(ymin = Low_Rel_Tests, ymax = High_Rel_Tests), alpha = 0.6, width=tick_relative_x, linewidth = 0.8) +
+  geom_point(size = 3, alpha = 1.0) +
+  theme_minimal() +
+  labs(
+    title = "Test Increase vs. Delay in Detection (Relative)",
+    x = "Relative Time to Detection (%)\n(100% = Low Frequency Baseline)",
+    y = "Relative Testing Burden (%)\n(100% = Low Frequency Baseline)",
+    color = "strategy",
+    shape = "strategy"
+  ) +
+  scale_color_manual(values = strategy_colors) +
+  scale_shape_manual(values = strategy_shapes) +
+  theme(legend.position = "bottom")
+
+# 6b. Generate the ABSOLUTE Scatter Plot
+plot_absolute <- ggplot(summary_results_ordered, aes(x = Med_Abs_Delay, y = Med_Abs_Tests, color = Strategy, shape = Strategy)) +
+  geom_abline(slope = tradeoff_slope_abs, intercept = tradeoff_intercept_abs, linetype = "dashed", color = "darkgray", linewidth = 0.8) +
+  geom_errorbar(aes(xmin = Low_Abs_Delay, xmax = High_Abs_Delay), alpha = 0.6, width=tick_absolute_y, linewidth = 0.8, orientation = "y") +
+  geom_errorbar(aes(ymin = Low_Abs_Tests, ymax = High_Abs_Tests), alpha = 0.6, width=tick_absolute_x, linewidth = 0.8) +
+  geom_point(size = 3, alpha = 1.0) +
+  
+  theme_minimal() +
+  labs(
+    title = "Test Increase vs. Delay in Detection",
+    x = "mean time-to-detection (days)",
+    y = "total number of tests performed",
+    color = "strategy",
+    shape = "strategy"
+  ) +
+  
+  scale_color_manual(values = strategy_colors) +
+  scale_shape_manual(values = strategy_shapes) +
+  
+  # 3. Restructure the legend to occupy exactly three rows (combining color and shape aesthetics)
+  guides(
+    color = guide_legend(nrow = 3, byrow = TRUE),
+    shape = guide_legend(nrow = 3, byrow = TRUE)
+  ) +
+  
+  # 4. Fine-tune the spacing and position
+theme(
+    legend.position = "bottom",
+
+    # Dramatically tightens the vertical gap between the 3 rows
+    legend.key.spacing.y = unit(0.02, "cm"),
+    legend.key.spacing.x = unit(0.02, "cm"),
+    # FIX: Explicitly call ggplot2::margin to prevent function masking conflicts
+    legend.margin = ggplot2::margin(t = 2, r = -1, b = 2, l = -1, unit = "pt")
+  )
+
+summary_results_ordered %>% 
+  print(width = Inf)
+
+# Display the plots
+print(plot_relative)
+print(plot_absolute)
+ggsave(paste0(manuscript_root, supplement, "relative_performance", paste0(reduced_months, collapse="-"), ".png"), plot = plot_relative, dpi = dpi, width = 20, height = 12, units = "cm", limitsize = FALSE)
+ggsave(paste0(manuscript_root, "absolute_performance", paste0(reduced_months, collapse="-"), ".png"), plot = plot_absolute, dpi = dpi, width = 20, height = 12, units = "cm", limitsize = FALSE)
+
+```
+Gaurav: "2 weeks time to detection is clinically relevant"
+
+# Analysis of emulated trajectories
+The number of cfDNA tests in the real and emulated schedules (assuming no loss of follow-up or study drop-outs).
+```{r Derive time-to-detection}
+#######################################################################################################################################
+
+patient_level_results_selected <- patient_level_results %>%
+  # Filter down to the strategies you want to keep
+  filter(Strategy %in% c("EF", "SF", "PF (T2 ≥ 45)")) %>%
+  
+  # Rename the cutoff 50 strategy to just "PF"
+  mutate(
+    Strategy = as.character(Strategy),
+    Strategy = if_else(Strategy == "PF (T2 ≥ 45)", "PF", Strategy),
+    Strategy = factor(Strategy) # Re-encode as factor for downstream grouping/plotting
+  ) %>% 
+  group_by(patient_id, Strategy) %>% 
+  summarise(
+    TTD = mean(TTD),
+    .groups = "drop"
+  ) %>%
+  ungroup()
+
+patient_level_wide <- patient_level_results_selected %>%
+  pivot_wider(
+    id_cols = c(patient_id),
+    names_from = Strategy,
+    # Pull both metrics into the horizontal expansion
+    values_from = c(TTD),
+    # Use a clean separator for the new column names (e.g., TTD_PF, TTD_SF)
+    names_sep = "."
+  )
+```
+
+By removing samples (i.e. changing the previous sample), positivity may be introduced based on relative increase. This can lead to new positivity that wasn't assumed during simulation of an event onset date. Consequently, we may introduce negative time-to-detection.
+We remove this artifact by removing these cases from the analysis.
+```{r Filter negative time-to-detection cases}
+print(nrow(patient_level_wide %>% filter(SF < 0)))
+print(patient_level_wide %>% filter(SF < 0), width=Inf)
+patient_level_wide <- patient_level_wide %>%
+  #filter(time_to_detection.thin >= 0)
+  filter(is.na(SF) | SF >= 0)
+```
+
+Time-to-detection based on immune surveillance schema considering a fixed PIRCHE score cutoff in the personalized schema. Given this is a paired significance test (because we have virtual twins in each of the columns), the p value is pretty low - yet the effect size is what matters here.
+```{r Plot time-to-detection distributions}
+my_comparisons <- list(
+  c("EF", "PF"),
+  c("PF", "SF"),
+  c("EF", "SF")
+)
+
+plot_data_temp <- patient_level_wide %>%
+  # 1. Reshape the data: gather the two columns into a long format
+  pivot_longer(
+    cols = c(EF, PF, SF),
+    names_to = "Dataset_Version",
+    values_to = "Time"
+  ) %>%
+    filter(!is.na(Time)) %>%
+  group_by(patient_id) %>%
+
+  # filter to have only complete cases (for paired testing)
+  filter(n() == 3) %>%
+
+  # Ungroup and sort so rows perfectly align for the paired Wilcoxon test
+  ungroup() 
+
+plot_data <- plot_data_temp%>%
+  group_by(patient_id, Dataset_Version) %>%
+  summarise(
+    Time = mean(Time),
+    .groups = "drop"
+  ) %>%
+  ungroup %>%
+  arrange(patient_id, Dataset_Version)
+
+stat_test <- plot_data %>%
+  wilcox_test(
+    Time ~ Dataset_Version,
+    paired = TRUE,
+    comparisons = my_comparisons
+  )
+
+group_medians <- plot_data %>%
+  group_by(Dataset_Version) %>%
+  summarise(med = median(Time), .groups = "drop")
+
+group_means <- plot_data %>%
+  group_by(Dataset_Version) %>%
+  summarise(mn = mean(Time), .groups = "drop")
+stat_test_enriched <- stat_test %>%
+  left_join(group_medians, by = c("group1" = "Dataset_Version")) %>%
+  rename(med1 = med) %>%
+  left_join(group_medians, by = c("group2" = "Dataset_Version")) %>%
+  rename(med2 = med) %>%
+  left_join(group_means, by = c("group1" = "Dataset_Version")) %>%
+  rename(mn1 = mn) %>%
+  left_join(group_means, by = c("group2" = "Dataset_Version")) %>%
+  rename(mn2 = mn) %>%
+  mutate(
+    delta_median = round(med2, 1) - round(med1, 1),
+    delta_mean = round(mn2, 1) - round(mn1, 1),
+    
+    # SPLIT LOGIC: Define the upper and lower text components separately
+    label_p_value = paste0("p = ", p),
+    label_deltas  = paste0("ΔM = ", round(delta_median, 1), " days\nΔμ = ", round(delta_mean, 1))
+  ) %>%
+  add_y_position(step.increase = 0.22)
+
+# 2. Build the boxplot
+ttd_boxplot <- ggplot(data = plot_data, aes(x = Dataset_Version, y = Time, fill = Dataset_Version)) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.colour = "red",
+    outlier.alpha = 0.5
+  ) +
+
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 24,
+    size = 2.5,
+    fill = "white",
+    color = "gray20",
+    stroke = 0.8
+  ) +
+  
+  # LAYER 1: Draws the actual geometric brackets and places the P-value ABOVE it
+  stat_pvalue_manual(
+    stat_test_enriched,
+    label = "label_p_value",
+    tip.length = 0.02,
+    vjust = -0.4,             # Positive vertical offset (shifts up)
+    lineend = "round"
+  ) +
+  
+  # LAYER 2: Suppresses the bracket lines (tip.length = 0) and drops the deltas BELOW it
+  stat_pvalue_manual(
+    stat_test_enriched,
+    label = "label_deltas",
+    tip.length = 0,           # Eliminates duplicate prong rendering
+    remove.bracket = TRUE,    # Disables drawing duplicate line geometry entirely
+    vjust = 1.25,             # Negative vertical offset (shifts down)
+    lineheight = 0.9          # Tightens line spacing for the sub-metrics
+  ) +
+  
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values=c("SF" = pirche_gradient_11[11], "EF" = pirche_gradient_11[1], "PF" = pirche_gradient_11[5])) +
+  
+  theme_minimal() +
+  labs(
+    title = "Comparison of Time to Detection (TTD)",
+    x = "schedule",
+    y = "time-to-detection (days)"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+print(ttd_boxplot)
+ggsave(paste0(manuscript_root, "ttd_boxplot.png"), plot = ttd_boxplot, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+
+# 2. Calculate the descriptive statistics (Median, 25th, and 75th percentiles)
+cohort_metrics <- plot_data %>%
+  group_by(Dataset_Version) %>%
+  summarise(
+    Median = median(Time),
+    Mean = mean(Time),
+    Q1_25th = quantile(Time, 0.25),
+    Q3_75th = quantile(Time, 0.75),
+    Total_Patients = n(),
+    .groups = "drop"
+  ) %>%
+  # Arrange metrics in order: EF, PF, SF
+  arrange(factor(Dataset_Version, levels = c("EF", "PF", "SF")))
+
+# 3. Output a clean summary block to your R console
+cat("\n=======================================================\n")
+cat("      DESCRIPTIVE STATS: TIME TO DETECTION (DAYS)      \n")
+cat("=======================================================\n")
+print(cohort_metrics)
+cat("=======================================================\n\n")
+
+# 4. Generate pre-formatted copy-paste inline text blocks for your manuscript
+cat("--- Manuscript Text Ready Formats ---\n")
+invisible(apply(cohort_metrics, 1, function(row) {
+  cat(paste0(
+    row["Dataset_Version"], " Group: Median = ", round(as.numeric(row["Median"]), 1),
+    " days (IQR: ", round(as.numeric(row["Q1_25th"]), 1), 
+    " to ", round(as.numeric(row["Q3_75th"]), 1), " days) ",
+    " mean = ", round(as.numeric(row["Mean"]), 1), "\n"
+  ))
+}))
+
+# 3. Output a clean summary block to your R console
+cat("\n=======================================================\n")
+cat("      DESCRIPTIVE STATS: LONG DETECTION CASES      \n")
+cat("=======================================================\n")
+
+long_detection_counts <- plot_data %>%
+  # 1. Filter for rows where time is greater than 100 days
+  # (and ensure there are no NA values in the relevant columns)
+  filter(Time > 42 & !is.na(Time) & !is.na(Dataset_Version)) %>%
+  
+  # 2. Group by the cfDNA assay type
+  group_by(Dataset_Version) %>%
+  
+  # 3. Count the rows meeting the condition
+  summarise(
+    Data_Points_Beyond_Days = n(),
+    .groups = "drop"
+  ) %>%
+  
+  # 4. Sort from highest count to lowest
+  arrange(desc(Data_Points_Beyond_Days))
+
+# Print the result to your console
+print(long_detection_counts)
+cat("=======================================================\n\n")
+
+```
+
+```{r}
+
+cfdna_pers <- bind_rows(emulation_cfdna_filtered %>% filter(PIRCHE_II >= pirche_cutoff), emulation_cfdna_thinned %>% filter(PIRCHE_II < pirche_cutoff))
+
+#cfdna_transient <- filter_post_positivity(emulation_cfdna_filtered) #%>% filter(type_cfdna == 1)
+cfdna_transient <- filter_post_positivity(cfdna_pers)
+
+# 1. Prepare the data: Calculate Ratio and Power, then filter out low-volume bars
+plot_pirche_ratios <- cfdna_transient %>%
+  filter(!is.na(positivity) & !is.na(PIRCHE_II)) %>%
+  
+  mutate(
+    PIRCHE_Group = if_else(PIRCHE_II < pirche_cutoff, low_pirche_label, high_pirche_label)
+  ) %>%
+  
+  group_by(assigned_month, PIRCHE_Group) %>%
+  summarise(
+    Ratio = sum(positivity == 1) / n(),
+    Total_Tests = n(),
+    .groups = "drop"
+  ) %>%
+  
+  # --- NEW: Only keep bars that meet your data point threshold ---
+  filter(Total_Tests > 15)
+
+plot_pirche_ratios$PIRCHE_Group <- factor(
+  plot_pirche_ratios$PIRCHE_Group, 
+  levels = c(low_pirche_label, high_pirche_label)
+)
+
+custom_palette <- setNames(
+  c(pirche_green, pirche_purple), 
+  c(low_pirche_label, high_pirche_label)
+)
+
+# 2. Generate the Grouped Bar Plot
+plot_pirche_ratio_dn_PF <- ggplot(plot_pirche_ratios, aes(x = assigned_month, y = Ratio, fill = PIRCHE_Group)) +
+  
+  geom_bar(
+    stat = "identity", 
+    position = position_dodge(width = 0.8), 
+    width = 0.7, 
+    alpha = 0.85
+  ) +
+    geom_text(
+    aes(
+      label = paste0("n = ", Total_Tests),
+      group = PIRCHE_Group # Ensures text dodges exactly like the bars do
+    ),
+    position = position_dodge(width = 0.9),
+    hjust = -0.2,           # Changed from vjust to hjust to align vertical text cleanly
+    vjust = 0.4,
+    angle = 90,             # Rotates text 90 degrees (vertical)
+    size = 3,
+    fontface = "bold",
+    color = "gray20"
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "de novo ddcfDNA Positivity Ratio by PIRCHE-T2",
+    x = "Time Post-Transplant (Months)",
+    y = "Positivity Ratio",
+    fill = "Immunological Risk Group"
+  ) +
+  
+  scale_x_continuous(breaks = target_months) +
+  
+  # Increased the top padding slightly more (0.22) so the vertical text doesn't hit the ceiling
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.22))) +
+  scale_fill_manual(values = custom_palette) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.minor.x = element_blank(),
+    legend.position = "top"
+  )
+print(plot_pirche_ratio_dn_PF)
+ggsave(paste0(manuscript_root, supplement, "positivity_ratio_de_novo_pf.png"), plot = plot_pirche_ratio_dn_PF, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+```
+
+```{r}
+
+positivity_forward_high_pirche <- cfdna_transient %>% filter(PIRCHE_II >= pirche_cutoff) #cfdna_positivity_scheduled(emulation_cfdna_filtered %>% filter(PIRCHE_II >= pirche_cutoff), schedule = target_months)
+positivity_forward_low_pirche <- cfdna_positivity_scheduled(emulation_cfdna_filtered %>% filter(PIRCHE_II < pirche_cutoff), schedule = reduced_months) 
+
+positivity_forward_low_pirche_filtered <- positivity_forward_low_pirche %>% group_by(patient_id) %>%
+  filter(
+    (assigned_month %in% reduced_months)
+  ) %>%
+  ungroup()
+cfdna_transient_limited_carry_forward <- bind_rows(positivity_forward_high_pirche, positivity_forward_low_pirche_filtered)
+
+# 1. Prepare the data: Calculate Ratio and Power, then filter out low-volume bars
+plot_pirche_ratios <- cfdna_transient_limited_carry_forward %>%
+  filter(!is.na(positivity) & !is.na(PIRCHE_II)) %>%
+  
+  mutate(
+    PIRCHE_Group = if_else(PIRCHE_II < pirche_cutoff, low_pirche_label, high_pirche_label)
+  ) %>%
+  
+  group_by(assigned_month, PIRCHE_Group) %>%
+  summarise(
+    Ratio = sum(positivity == 1) / n(),
+    Total_Tests = n(),
+    .groups = "drop"
+  ) %>%
+  
+  # --- NEW: Only keep bars that meet your data point threshold ---
+  filter(Total_Tests > 15)
+
+plot_pirche_ratios$PIRCHE_Group <- factor(
+  plot_pirche_ratios$PIRCHE_Group, 
+  levels = c(low_pirche_label, high_pirche_label)
+)
+
+custom_palette <- setNames(
+  c(pirche_green, pirche_purple), 
+  c(low_pirche_label, high_pirche_label)
+)
+
+print(plot_pirche_ratios)
+
+# 2. Generate the Grouped Bar Plot
+plot_pirche_ratio_PF <- ggplot(plot_pirche_ratios, aes(x = assigned_month, y = Ratio, fill = PIRCHE_Group)) +
+  
+  geom_bar(
+    stat = "identity", 
+    position = position_dodge(width = 0.8), 
+    width = 0.7, 
+    alpha = 0.85
+  ) +
+    geom_text(
+    aes(
+      label = paste0("n = ", Total_Tests),
+      group = PIRCHE_Group # Ensures text dodges exactly like the bars do
+    ),
+    position = position_dodge(width = 0.9),
+    hjust = -0.2,           # Changed from vjust to hjust to align vertical text cleanly
+    vjust = 0.4,
+    angle = 90,             # Rotates text 90 degrees (vertical)
+    size = 3,
+    fontface = "bold",
+    color = "gray20"
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "ddcfDNA Positivity Ratio by PIRCHE-T2",
+    x = "Time Post-Transplant (Months)",
+    y = "Positivity Ratio",
+    fill = "Immunological Risk Group"
+  ) +
+  
+  scale_x_continuous(breaks = target_months) +
+  
+  # Increased the top padding slightly more (0.22) so the vertical text doesn't hit the ceiling
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.22))) +
+  scale_fill_manual(values = custom_palette) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.minor.x = element_blank(),
+    legend.position = "top"
+  )
+print(plot_pirche_ratio_PF)
+ggsave(paste0(manuscript_root, supplement, "positivity_ratio_pf.png"), plot = plot_pirche_ratio_PF, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+```
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+library(ggrepel)
+library(gridExtra)
+
+# 1. Normalize the metrics to a 0-1 scale WITHIN each random seed safely
+sim_results_processed <- sim_results %>%
+  group_by(Seed) %>%
+  mutate(
+    # Min-Max Scaling calculated strictly within each strategy's group
+    Delay_Scaled = (Absolute_Delay - min(Absolute_Delay, na.rm = TRUE)) / 
+                   (max(Absolute_Delay, na.rm = TRUE) - min(Absolute_Delay, na.rm = TRUE)),
+    
+    Tests_Scaled = (Absolute_Tests - min(Absolute_Tests, na.rm = TRUE)) / 
+                   (max(Absolute_Tests, na.rm = TRUE) - min(Absolute_Tests, na.rm = TRUE)),
+    
+    # Calculate composite score on locally weighted inputs
+    nxttd = 1- 0.5*(Delay_Scaled + Tests_Scaled)
+  ) %>%
+  ungroup() %>% # CRITICAL: Ungroup so the subsequent sorting and Wilcox tests run across strategies
+  
+  # Reorder the Strategy factor by the new localized median descending
+  mutate(Strategy = fct_reorder(Strategy, nxttd, .fun = median, .desc = FALSE))
+# 2. Define your target comparison pairs explicitly
+target_comparisons <- list(
+  c("RC 1:2", "EF"),
+  c("PF (T2 ≥ 45)", "RC 1:2")
+)
+
+# 3. Compute Wilcoxon tests using highly resilient Base R wilcox.test()
+compute_base_wilcox <- function(data, pair) {
+  g1 <- data %>% filter(Strategy == pair[1]) %>% pull(nxttd)
+  g2 <- data %>% filter(Strategy == pair[2]) %>% pull(nxttd)
+  
+  # Base R safely catches zero variance cases
+  p_val <- tryCatch({
+    wilcox.test(g1, g2, exact = FALSE, correct = TRUE)$p.value
+  }, error = function(e) {
+    return(1.0) # Safety fallback if vectors are completely uncomputable
+  })
+  
+  tibble(
+    group1 = pair[1],
+    group2 = pair[2],
+    p = if_else(is.na(p_val), 1.0, p_val)
+  )
+}
+
+# Run the tests and apply the Bonferroni adjustment manually
+selected_comparisons_raw <- map_dfr(target_comparisons, ~compute_base_wilcox(sim_results_processed, .x))
+
+selected_comparisons <- selected_comparisons_raw %>%
+  mutate(
+    .y. = "nxttd",
+    p.adj = pmin(p * length(target_comparisons), 1.0), # Bonferroni adjustment multiplier
+    p.adj.signif = case_when(
+      p.adj < 0.001 ~ "***",
+      p.adj < 0.01  ~ "**",
+      p.adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  )
+
+# 4. Map the geometric Y coordinates manually to avoid rstatix dependencies
+# Find the absolute peak of your data to set the first bracket position
+max_y <- max(sim_results_processed$nxttd, na.rm = TRUE)
+y_step <- max_y * 0.12
+
+selected_comparisons <- selected_comparisons %>%
+  mutate(
+    y.position = max_y + (row_number() * y_step),
+    xmin = group1,
+    xmax = group2
+  )
+
+# 5. Generate the sorted boxplot
+nttd_plot <- ggplot(sim_results_processed, aes(x = Strategy, y = nxttd, color=Strategy, fill = Strategy)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 16, outlier.size = 1.5) +
+  
+  # Overlay the manually generated robust brackets
+  stat_pvalue_manual(
+    selected_comparisons, 
+    label = "p.adj.signif", 
+    tip.length = 0.02
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "strategy",
+    y = "efficiency\nMNT = (1 - mean(n, ttd))") +
+  
+  scale_fill_manual(values = strategy_colors) +
+  scale_color_manual(values = strategy_colors) +
+  
+  # Expand the upper limits of the Y axis so the custom brackets fit perfectly
+  scale_y_continuous(limits = c(min(sim_results_processed$nxttd), max(selected_comparisons$y.position) + (y_step / 2))) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+print(nttd_plot)
+ggsave(paste0(manuscript_root, supplement, "tte_mnt.png"), plot = nttd_plot, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+
+panel <- arrangeGrob(plot_absolute, nttd_plot, layout_matrix = rbind(c(1, 1, 2)), ncol = 3)
+ggsave(paste0(manuscript_root, "tte_effectiveness_multipanel.png"), plot = panel, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
+
+
+strategy_medians <- sim_results_processed %>%
+  group_by(Strategy) %>%
+  summarise(
+    Min_nxttd    = min(nxttd, na.rm = TRUE),
+    Q1_nxttd     = quantile(nxttd, 0.25, na.rm = TRUE), # 25th Percentile
+    Median_nxttd = median(nxttd, na.rm = TRUE),        # 50th Percentile
+    Q3_nxttd     = quantile(nxttd, 0.75, na.rm = TRUE), # 75th Percentile
+    Max_nxttd    = max(nxttd, na.rm = TRUE),
+    Sample_Size  = n(),
+    .groups = "drop"
+  ) %>%
+  # Arrange from lowest footprint (most efficient) to highest
+  arrange(Median_nxttd)
+
+# Print the structured summary table to the console
+print(strategy_medians)
+```
