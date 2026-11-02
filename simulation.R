@@ -13,26 +13,23 @@ simulate_detection <- function(risk_group, event_time, has_event, sens, spec) {
 
   schedule <- if (risk_group == "High Risk") {
     schedule_high
+  } else if (risk_group == "Mid Risk") {
+    schedule_mid
   } else {
-    if (risk_group == "Mid Risk") {
-      schedule_mid
-    } else {
-      schedule_low
-    }
+    schedule_low
   }
+
   # Initialize counters for this patient
   n_tp <- 0; n_fp <- 0; n_tn <- 0; n_fn <- 0
   detect_time <- max_follow_up
   status <- 0
 
   for (test_day in schedule) {
-
     # 1. Determine Disease Status at this specific day
     is_sick <- has_event && (test_day >= event_time)
 
     # 2. Simulate Test Result
     if (is_sick) {
-      # Patient has rejection. Test is Positive with prob = Sensitivity
       test_result <- rbinom(1, 1, sens)
       if (test_result == 1) {
         n_tp <- n_tp + 1
@@ -40,19 +37,14 @@ simulate_detection <- function(risk_group, event_time, has_event, sens, spec) {
         status <- 1
         break # Stop testing after detection (biopsy & treat)
       } else {
-        n_fn <- n_fn + 1 # False Negative (Missed it!)
+        n_fn <- n_fn + 1 # False Negative
       }
     } else {
-      # Patient is stable. Test is Positive with prob = (1 - Specificity)
-      # This is a False Positive (False Alarm)
       test_result <- rbinom(1, 1, 1 - spec)
       if (test_result == 1) {
-        n_fp <- n_fp + 1
-        # Assumption: False Positive leads to biopsy, which is negative.
-        # Monitoring continues? Or stops?
-        # Usually monitoring continues, so we DO NOT break here.
+        n_fp <- n_fp + 1 # False Positive
       } else {
-        n_tn <- n_tn + 1 # True Negative (Reassured)
+        n_tn <- n_tn + 1 # True Negative
       }
     }
   }
@@ -81,104 +73,97 @@ manuscript_root <- "/Users/pir-mn/Library/CloudStorage/GoogleDrive-matthias.niem
 supplement <- "supplement/"
 
 # Cohort settings
-iterations <- 1000  # number of repeats
-n_patients <- 200    # how many patients to simulate
-max_follow_up <- 3*360 # follow-up in days
+iterations <- 100  # number of repeats
+n_patients <- 200   # how many patients to simulate
+max_follow_up <- 3 * 360 # follow-up in days
 
-first_attempt <- data.frame(
-  prop_high_risk=0.5, # 50% of patients are High PIRCHE
-  hr_high_risk=1.5,
-  baseline_incidence_1yr=0.015, # 1.5% ABMR rate in Low Risk at 1 year
-  test_sensitivity=0.83, # dd-cfDNA + dnDSA Test Performance
-  test_specificity=0.79 # dd-cfDNA + dnDSA Test Performance
+# ----------------------------------------------------
+# Define Set of (Sensitivity, Specificity) Tuples Here
+# ----------------------------------------------------
+test_scenarios <- tibble::tribble(
+  ~scenario_id,             ~test_sensitivity, ~test_specificity,
+  "Bloom_2017",             0.59,              0.85,
+  "Sigdel_2019",            0.89,              0.73,
+  "Whitlam_2019_1",         0.85,              0.75,
+  "Whitlam_2019_2",         0.85,              0.79,
+  "Oellerich_2019_1",       0.73,              0.69,
+  "Oellerich_2019_2",       0.73,              0.73,
+  "Huang_2019",             0.79,              0.72,
+  "Dauber_2020",            0.88,              0.81,
+  "Zhang_2020",             0.89,              0.74,
+  "De_Vlaminck_2014",       0.58,              0.93,
+  "Richmond_2020",          0.60,              0.92,
+  "Khush_2019",             0.44,              0.80,
+  "Agbor_Enoh_2021",        0.81,              0.85,
+  "Knuettgen_2022",         0.76,              0.83,
+  "Kim_2022",               0.79,              0.77,
+  "Sorbini_2021",           0.64,              0.71,
+  "De_Vlaminck_2015",       1.00,              0.73,
+  "Sayah_2020",             0.73,              0.53,
+  "Khush_2021",             0.56,              0.76,
+  "Jang_2021",              0.77,              0.84,
+  "Keller_2022",            0.76,              0.70,
+  "Rosenheck_2022",         0.89,              0.83,
+  "Schuetz_2017",           0.90,              0.93,
+  "Levitsky_2021",          1.00,              0.80,
+  "Baumann_2022",           0.81,              0.91,
+  "Ventura_Aguiar_2022_1",  0.29,              1.00,
+  "Ventura_Aguiar_2022_2",  0.86,              0.94
 )
 
+# Study parameters (sensitivity and specificity removed from here)
 utah <- data.frame(
-  prop_high_risk=0.57,
-  hr_high_risk=1.4,
-  baseline_incidence_1yr=0.323,
-  test_sensitivity=0.80, # dd-cfDNA + dnDSA Test Performance
-  test_specificity=0.81 # dd-cfDNA + dnDSA Test Performance
+  name = "Utah",
+  prop_high_risk = 0.57,
+  hr_high_risk = 1.4,
+  baseline_incidence_1yr = 0.323
 )
 
 leuven <- data.frame(
-  prop_high_risk=0.33,
-  hr_high_risk=1.28,
-  baseline_incidence_1yr=0.097,
-  test_sensitivity=0.80, # dd-cfDNA + dnDSA Test Performance
-  test_specificity=0.81 # dd-cfDNA + dnDSA Test Performance
+  name = "Leuven",
+  prop_high_risk = 0.33,
+  hr_high_risk = 1.28,
+  baseline_incidence_1yr = 0.097
 )
 
 basel <- data.frame(
-  prop_high_risk=0.27,
-  hr_high_risk=2.19,
-  baseline_incidence_1yr=0.107,
-  test_sensitivity=0.80, # dd-cfDNA + dnDSA Test Performance
-  test_specificity=0.81 # dd-cfDNA + dnDSA Test Performance
+  name = "Basel",
+  prop_high_risk = 0.27,
+  hr_high_risk = 2.19,
+  baseline_incidence_1yr = 0.107
 )
-
-# Table with Parameters:
-# Utah
-# High-risk percentage: 57% (Table 1)
-# Hazard: 1.40 (Table 1, any rejection, 3y)
-# Baseline risk: 32.3% (Table 1, any rejection with PIRCHE-T2 low) @ 1 year
-# Leuven
-# High-risk percentage: 33% (Figure 3)
-# Hazard: 1.28 (37% /  ((27%+31%) / 2), Figure 3, high risk / low+int, @ 3 years)
-# Baseline risk: 23.5% (21%+26%) / 2 (Figure 3, low+int 3y incidence) @ 1 year
-# Does not take non-linearity into account, so attempt with 1/3rd of 3 years values
-# Baseline risk: 9.7% (27%+31%) / 2 / 3 (Figure 3, low+int 3y incidence) @ 1 year
-# Basel
-# High-risk percentage: 27% = 94/(262+83) (Table 1)
-# Hazard: 2.19 (23.4% / 10.7%, Table 2)
-# Baseline risk: 10.7% = 6% x (83/(83+262)) + 12.2% * (262/(83+262))(Table 2) @ 1 year
-
 
 simulation_parameters <- list(utah, leuven, basel)
 
-
 cost_pirche <- 1500
 cost_cfdna <- 2800 + 200 # cfDNA test + dsa test
-
 mode <- "low"
 
-########################## less frequent simulation
-schedule_high <- 30* c(1, 2, 3, 4, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36)
-# schedule_high <- 30* c(1, 2, 3, 4, 6, 12, 18, 24, 30, 36)
-# schedule_high <- 30 * c(seq(from = 1, to = 35, by = 2), 36)
+schedule_high <- 30 * c(1, 2, 3, 4, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36)
+schedule_low  <- 30 * c(3, 6, 9, 12, 24, 36)
 
-# Low Risk: Standard (e.g., Months 1, 3, 6, 12, then yearly)
-schedule_low <- 30 * c(3, 6, 9, 12, 24, 36)
+print(paste("Standard Schedule:", paste(schedule_low, collapse = ", ")))
+print(paste("High Schedule:", paste(schedule_high, collapse = ", ")))
 
-print(paste("Standard Schedule:", paste(schedule_low, collapse=", ")))
-print(paste("High Schedule:", paste(schedule_high, collapse=", ")))
-
-### plot frequency
+### Plot frequency
 plot_data <- data.frame(
   x_value = c(schedule_high, schedule_low),
   y_index = c(rep(1, length(schedule_high)), rep(2, length(schedule_low))),
   group_id = c(rep("EF", length(schedule_high)), rep("SF", length(schedule_low)))
 )
-
 plot_data$group_id <- factor(plot_data$group_id, levels = c("SF", "EF"))
 
-# 3. Create the ggplot
 schedule <- ggplot(plot_data, aes(x = x_value, y = y_index, color = group_id, shape = group_id)) +
-
-  # Add points (increase size for visibility)
   geom_point(size = 4, alpha = 0.8) +
-
-  # Optional: Manually choose your colors and symbols
   scale_color_manual(values = c("EF" = pirche_color_four[3], "SF" = pirche_color_four[1])) +
   scale_shape_manual(values = c("EF" = 17, "SF" = 15)) +
-  ylim(0,3) +
+  ylim(0, 3) +
   scale_x_continuous(breaks = seq(0, max(plot_data$x_value), by = 180)) +
-  # Clean up the theme
   theme_minimal() +
   theme(
-    axis.title.y = element_blank(), # Removes the label "y"
-    axis.text.y  = element_blank(), # Removes the numbers (1, 2, 3...)
-    axis.ticks.y = element_blank()  # Removes the little tick marks
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
   ) +
   labs(
     title = "Frequency of immune monitoring",
@@ -188,286 +173,177 @@ schedule <- ggplot(plot_data, aes(x = x_value, y = y_index, color = group_id, sh
     shape = "Schedule"
   )
 
-ggsave(paste0(manuscript_root, "schedule.png"), plot = schedule, dpi = dpi, width = fig_width, height = 0.4*fig_height, units = "cm", limitsize = FALSE)
+ggsave(paste0(manuscript_root, "schedule.png"), plot = schedule, dpi = dpi, width = fig_width, height = 0.4 * fig_height, units = "cm", limitsize = FALSE)
 
+# ====================================================
+# 2. RUN SIMULATIONS ACROSS STUDIES & TEST TUPLES
+# ====================================================
+global_result <- data.frame()
 
-global_result <- data.frame(strategy = character(), costs=numeric(), median_delay=numeric(), iteration=numeric(), simulation=numeric())
-
-for (index in seq(length(simulation_parameters))) {
-  # ==========================================
-  # 2. GENERATE PATIENT COHORT & EVENTS
-  # ==========================================
+for (index in seq_along(simulation_parameters)) {
   parameters <- simulation_parameters[[index]]
-  print(parameters)
-  joint_result <- data.frame(strategy = character(), costs=numeric(), median_delay=numeric(), iteration=numeric(), simulation=numeric())
 
-  for (iteration in seq(iterations)) {
-    set.seed(iteration * 42)
-    # set.seed(42) # For reproducibility
-    # Create Dataframe
-    cohort <- tibble(
-      id = 1:n_patients,
-      risk_group = sample(c("Low Risk", "High Risk"), n_patients, replace = TRUE,
-                          prob = c(1 - parameters$prop_high_risk, parameters$prop_high_risk))
-    )
+  for (scen_idx in seq_len(nrow(test_scenarios))) {
+    current_scenario <- test_scenarios[scen_idx, ]
+    sens_val <- current_scenario$test_sensitivity
+    spec_val <- current_scenario$test_specificity
+    scen_id  <- current_scenario$scenario_id
 
-    # Simulate (unknown) "True" Time to ABMR (Weibull Distribution)
-    # We solve for the scale parameter (lambda) so that the 1-year incidence
-    # matches our assumption for the Low Risk group.
-    shape_param <- 0.9 # Shape < 1 implies decreasing hazard (early risk is highest)
-    t_1yr <- 365
-    scale_low <- t_1yr / (-log(1 - parameters$baseline_incidence_1yr))^(1/shape_param)
+    cat(sprintf("Simulating Study: %s | Scenario: %s (Sens: %.2f, Spec: %.2f)\n",
+                parameters$name, scen_id, sens_val, spec_val))
 
-    # Generate event times
-    cohort <- cohort %>%
-      mutate(
-        # Apply Hazard Ratio: Scale parameter decreases as Risk increases
-        scale = ifelse(risk_group == "High Risk",
-                       scale_low / (parameters$hr_high_risk^(1/shape_param)),
-                       scale_low),
+    joint_result <- data.frame()
 
-        # Random draw from Weibull
-        true_event_time = rweibull(n(), shape = shape_param, scale = scale),
+    for (iteration in seq(iterations)) {
+      set.seed(iteration * 42)
 
-        # Censor events happening after follow-up time
-        has_event = true_event_time <= max_follow_up,
-        true_event_time = pmin(true_event_time, max_follow_up)
+      cohort <- tibble(
+        id = 1:n_patients,
+        risk_group = sample(c("Low Risk", "High Risk"), n_patients, replace = TRUE,
+                            prob = c(1 - parameters$prop_high_risk, parameters$prop_high_risk))
       )
 
-    # Apply simulation row-wise
-    results <- cohort %>%
-      rowwise() %>%
+      shape_param <- 0.9
+      t_1yr <- 365
+      scale_low <- t_1yr / (-log(1 - parameters$baseline_incidence_1yr))^(1 / shape_param)
+
+      cohort <- cohort %>%
+        mutate(
+          scale = ifelse(risk_group == "High Risk",
+                         scale_low / (parameters$hr_high_risk^(1 / shape_param)),
+                         scale_low),
+          true_event_time = rweibull(n(), shape = shape_param, scale = scale),
+          has_event = true_event_time <= max_follow_up,
+          true_event_time = pmin(true_event_time, max_follow_up)
+        )
+
+      # Simulate using current tuple's sens_val & spec_val
+      results <- cohort %>%
+        rowwise() %>%
+        mutate(
+          sim_res_mixed = list(simulate_detection(risk_group, true_event_time, has_event, sens_val, spec_val)),
+          detect_time_mixed = sim_res_mixed$detect_time,
+          status_mixed = sim_res_mixed$status,
+          n_tp_mixed = sim_res_mixed$n_tp, n_fp_mixed = sim_res_mixed$n_fp, n_tn_mixed = sim_res_mixed$n_tn, n_fn_mixed = sim_res_mixed$n_fn,
+          detection_delay_mixed = ifelse(status_mixed == 1, detect_time_mixed - true_event_time, NA)
+        ) %>%
+        ungroup() %>%
+        rowwise() %>%
+        mutate(
+          sim_res_low = list(simulate_detection("Low Risk", true_event_time, has_event, sens_val, spec_val)),
+          detect_time_low = sim_res_low$detect_time,
+          status_low = sim_res_low$status,
+          n_tp_low = sim_res_low$n_tp, n_fp_low = sim_res_low$n_fp, n_tn_low = sim_res_low$n_tn, n_fn_low = sim_res_low$n_fn,
+          detection_delay_low = ifelse(status_low == 1, detect_time_low - true_event_time, NA)
+        ) %>%
+        ungroup() %>%
+        rowwise() %>%
+        mutate(
+          sim_res_high = list(simulate_detection("High Risk", true_event_time, has_event, sens_val, spec_val)),
+          detect_time_high = sim_res_high$detect_time,
+          status_high = sim_res_high$status,
+          n_tp_high = sim_res_high$n_tp, n_fp_high = sim_res_high$n_fp, n_tn_high = sim_res_high$n_tn, n_fn_high = sim_res_high$n_fn,
+          detection_delay_high = ifelse(status_high == 1, detect_time_high - true_event_time, NA)
+        ) %>%
+        ungroup()
+
+      delay_mixed <- results %>%
+        filter(status_mixed == 1) %>%
+        summarise(median_delay = median(detection_delay_mixed, na.rm = TRUE))
+
+      delay_high <- results %>%
+        filter(status_high == 1) %>%
+        summarise(median_delay = median(detection_delay_high, na.rm = TRUE))
+
+      delay_low <- results %>%
+        filter(status_low == 1) %>%
+        summarise(median_delay = median(detection_delay_low, na.rm = TRUE))
+
+      tests_performed <- results %>%
+        rowwise() %>%
+        mutate(
+          schedule_mixed = list(if (risk_group == "High Risk") schedule_high else schedule_low),
+          n_tests_mixed = sum(unlist(schedule_mixed) > 0),
+          schedule_high = list(schedule_high),
+          n_tests_high = sum(unlist(schedule_high) > 0),
+          schedule_low = list(schedule_low),
+          n_tests_low = sum(unlist(schedule_low) > 0)
+        )
+
+      tests_performed_strategy_summary <- tests_performed %>%
+        ungroup() %>%
+        summarise(
+          total_tests_mixed = sum(n_tests_mixed),
+          total_tests_high  = sum(n_tests_high),
+          total_tests_low   = sum(n_tests_low)
+        )
+
+      result <- data.frame(
+        strategy = c("EF", "SF", "PF"),
+        costs = c(
+          tests_performed_strategy_summary$total_tests_high * cost_cfdna / 1e6,
+          tests_performed_strategy_summary$total_tests_low  * cost_cfdna / 1e6,
+          (tests_performed_strategy_summary$total_tests_mixed * cost_cfdna + nrow(cohort) * cost_pirche) / 1e6
+        ),
+        tests = c(
+          tests_performed_strategy_summary$total_tests_high,
+          tests_performed_strategy_summary$total_tests_low,
+          tests_performed_strategy_summary$total_tests_mixed
+        ),
+        median_delay = c(
+          delay_high$median_delay,
+          delay_low$median_delay,
+          delay_mixed$median_delay
+        ),
+        iteration = iteration,
+        simulation = parameters$name,
+        scenario = scen_id,
+        sensitivity = sens_val,
+        specificity = spec_val
+      )
+      result$delay_per_cost <- result$median_delay / result$costs
+
+      joint_result <- bind_rows(joint_result, result)
+      global_result <- bind_rows(global_result, result)
+    }
+
+    # Cost-effectiveness plot for each study & scenario
+    labeled_points <- joint_result %>%
+      group_by(strategy) %>%
       mutate(
-        sim_res_mixed = list(simulate_detection(risk_group, true_event_time, has_event, parameters$test_sensitivity, parameters$test_specificity)),
-        detect_time_mixed = sim_res_mixed$detect_time,
-        status_mixed = sim_res_mixed$status, # 1 = Detected, 0 = Censored/Missed
-        n_tp_mixed = sim_res_mixed$n_tp, n_fp_mixed = sim_res_mixed$n_fp, n_tn_mixed = sim_res_mixed$n_tn, n_fn_mixed = sim_res_mixed$n_fn,
-        # Calculate "Delay" (Time detected - Time onset)
-        # Only relevant for detected patients
-        detection_delay_mixed = ifelse(status_mixed == 1, detect_time_mixed - true_event_time, NA)
+        target_x = median(median_delay, na.rm = TRUE),
+        target_y = median(costs, na.rm = TRUE),
+        dist_to_center = sqrt((median_delay - target_x)^2 + (costs - target_y)^2)
       ) %>%
-      ungroup() %>%
-      rowwise() %>%
-      mutate(
-        sim_res_low = list(simulate_detection("Low Risk", true_event_time, has_event, parameters$test_sensitivity, parameters$test_specificity)),
-        detect_time_low = sim_res_low$detect_time,
-        status_low = sim_res_low$status, # 1 = Detected, 0 = Censored/Missed
-        n_tp_low = sim_res_low$n_tp, n_fp_low = sim_res_low$n_fp, n_tn_low = sim_res_low$n_tn, n_fn_low = sim_res_low$n_fn,
-        # Calculate "Delay" (Time detected - Time onset)
-        # Only relevant for detected patients
-        detection_delay_low = ifelse(status_low == 1, detect_time_low - true_event_time, NA)
-      ) %>%
-      ungroup() %>%
-      rowwise() %>%
-      mutate(
-        sim_res_high = list(simulate_detection("High Risk", true_event_time, has_event, parameters$test_sensitivity, parameters$test_specificity)),
-        detect_time_high = sim_res_high$detect_time,
-        status_high = sim_res_high$status, # 1 = Detected, 0 = Censored/Missed
-        n_tp_high = sim_res_high$n_tp, n_fp_high = sim_res_high$n_fp, n_tn_high = sim_res_high$n_tn, n_fn_high = sim_res_high$n_fn,
-        # Calculate "Delay" (Time detected - Time onset)
-        # Only relevant for detected patients
-        detection_delay_high = ifelse(status_high == 1, detect_time_high - true_event_time, NA)
-      ) %>%
-      ungroup()
+      filter(dist_to_center == min(dist_to_center)) %>%
+      slice(1)
 
-    # ==========================================
-    # 4. ANALYSIS & VISUALIZATION
-    # ==========================================
-    # A. Cumulative Incidence of Detection (Kaplan-Meier)
-    fit <- survfit(Surv(true_event_time, status_mixed) ~ risk_group, data = results)
-
-    survplot <- ggsurvplot(
-      fit,
-      data = results,
-      fun = "event", # Plot cumulative events (detections) rather than survival
-      risk.table = TRUE,
-      pval = TRUE,
-      title = "Time to ABMR stratified by PIRCHE",
-      xlab = "Days Post-Transplant",
-      ylab = "ABMR incidence",
-      palette = c("red", "blue"),
-      legend.labs = c("High Risk", "Low Risk")
-    )
-
-    # B. Analysis of Detection Delay (for those detected)
-    delay_summary_mixed <- results %>%
-      filter(status_mixed == 1) %>%
-      group_by(risk_group) %>%
-      summarise(
-        n_detected = n(),
-        median_delay_days_mixed = median(detection_delay_mixed),
-        mean_delay_days_mixed = mean(detection_delay_mixed),
-        sd_delay_mixed = sd(detection_delay_mixed)
-      )
-    delay_mixed <- results %>%
-      filter(status_mixed == 1) %>%
-      summarise(
-        n_detected = n(),
-        median_delay_days_mixed = median(detection_delay_mixed),
-        mean_delay_days_mixed = mean(detection_delay_mixed),
-        sd_delay_mixed = sd(detection_delay_mixed)
+    cost_effectiveness <- ggplot(joint_result, aes(x = median_delay, y = costs, color = strategy)) +
+      geom_point(size = 1, alpha = 0.25) +
+      geom_text(
+        data = labeled_points,
+        aes(label = paste0(strategy, "\n(", sprintf(paste0("%.", decimals, "f"), target_y), "M $, ", sprintf(paste0("%.", decimals, "f"), target_x), "d)"),
+            x = target_x, y = target_y),
+        vjust = -0.5, fontface = "bold", lineheight = 0.8, size = 4, show.legend = FALSE
+      ) +
+      geom_point(data = labeled_points, size = 4, shape = 3, color = "black") +
+      scale_color_manual(values = c("EF" = pirche_color_four[3], "SF" = pirche_color_four[1], "PF" = pirche_color_four[4])) +
+      theme_light() +
+      labs(
+        title = paste0(parameters$name, " (", scen_id, ")\nCost effectiveness (n = ", n_patients, ")"),
+        x = "median days to detection (lower is better)",
+        y = "costs in millions (lower is better)",
+        color = "Schedule"
       )
 
-    delay_summary_high <- results %>%
-      filter(status_high == 1) %>%
-      group_by(risk_group) %>%
-      summarise(
-        n_detected = n(),
-        median_delay_days_high = median(detection_delay_high),
-        mean_delay_days_high = mean(detection_delay_high),
-        sd_delay_high = sd(detection_delay_high)
-      )
-    delay_high <- results %>%
-      filter(status_high == 1) %>%
-      summarise(
-        n_detected = n(),
-        median_delay_days_high = median(detection_delay_high),
-        mean_delay_days_high = mean(detection_delay_high),
-        sd_delay_high = sd(detection_delay_high)
-      )
-
-    delay_summary_low <- results %>%
-      filter(status_low == 1) %>%
-      group_by(risk_group) %>%
-      summarise(
-        n_detected = n(),
-        median_delay_days_low = median(detection_delay_low),
-        mean_delay_days_low = mean(detection_delay_low),
-        sd_delay_low = sd(detection_delay_low)
-      )
-    delay_low <- results %>%
-      filter(status_low == 1) %>%
-      summarise(
-        n_detected = n(),
-        median_delay_days_low = median(detection_delay_low),
-        mean_delay_days_low = mean(detection_delay_low),
-        sd_delay_low = sd(detection_delay_low)
-      )
-
-    # print("Summary of Diagnostic Delay (Days between Onset and Test Positive) mixed:")
-    # print(delay_summary_mixed)
-    # print(delay_mixed)
-    # print("Summary of Diagnostic Delay (Days between Onset and Test Positive) high:")
-    # print(delay_summary_high)
-    # print(delay_high)
-    # print("Summary of Diagnostic Delay (Days between Onset and Test Positive) low:")
-    # print(delay_summary_low)
-    # print(delay_low)
-    # print("Summary of Diagnostic Delay (Days between Onset and Test Positive) mid:")
-    # print(delay_summary_mid)
-    # print(delay_mid)
-
-    # C. Efficiency Metric (Tests per Detection)
-    # Calculate total tests performed
-    tests_performed <- results %>%
-      rowwise() %>%
-      mutate(
-        schedule_mixed = list(if (risk_group == "High Risk") schedule_high else schedule_low),
-        # Count tests performed up to detection or censoring
-        # n_tests_mixed = sum(unlist(schedule_mixed) <= detect_time_mixed), # use this if only count tests until positivity
-        n_tests_mixed = sum(unlist(schedule_mixed) > 0),
-        schedule_high = list(schedule_high),
-        # n_tests_high = sum(unlist(schedule_high) <= detect_time_high),
-        n_tests_high = sum(unlist(schedule_high) > 0),  # use this if only count tests until positivity
-        schedule_low = list(schedule_low),
-        # n_tests_low = sum(unlist(schedule_low) <= detect_time_low)  # use this if only count tests until positivity
-        n_tests_low = sum(unlist(schedule_low) > 0)
-      )
-
-    tests_performed_strategy_summary <- tests_performed %>%
-      group_by(1) %>%
-      summarise(
-        total_tests_mixed = sum(n_tests_mixed),
-        total_detections_mixed = sum(status_mixed),
-        tests_per_detection_mixed = total_tests_mixed / total_detections_mixed,
-        total_tests_high = sum(n_tests_high),
-        total_detections_high = sum(status_high),
-        tests_per_detection_high = total_tests_high / total_detections_high,
-        total_tests_low = sum(n_tests_low),
-        total_detections_low = sum(status_low),
-        tests_per_detection_low = total_tests_low / total_detections_low
-      )
-
-    tests_performed_mixed_summary <- tests_performed  %>%
-      group_by(risk_group) %>%
-      summarise(
-        total_tests_mixed = sum(n_tests_mixed),
-        total_detections_mixed = sum(status_mixed),
-        tests_per_detection = total_tests_mixed / total_detections_mixed
-      )
-
-    # print("Efficiency Analysis:")
-    # print(tests_performed_mixed_summary)
-    # print(tests_performed_strategy_summary)
-
-    result <- data.frame(strategy = c("EF", "SF", "PF"),
-                         costs=c(tests_performed_strategy_summary$total_tests_high * cost_cfdna / 1000000, tests_performed_strategy_summary$total_tests_low * cost_cfdna / 1000000, (tests_performed_strategy_summary$total_tests_mixed * cost_cfdna + nrow(cohort) * cost_pirche) / 1000000),
-                         tests=c(tests_performed_strategy_summary$total_tests_high, tests_performed_strategy_summary$total_tests_low, tests_performed_strategy_summary$total_tests_mixed),
-                          median_delay=c(delay_high$median_delay_days_high, delay_low$median_delay_days_low, delay_mixed$median_delay_days_mixed))
-    result$delay_per_cost <- result$median_delay / result$costs
-    result$iteration <- iteration
-    result$simulation <- index
-
-    joint_result <- rbind(joint_result, result)
-    global_result <- rbind(global_result, result)
+    ggsave(paste0(manuscript_root, "sim_effectiveness/cost_effectiveness_", parameters$name, "_", scen_id, ".png"),
+           plot = cost_effectiveness, dpi = dpi, width = fig_width, height = fig_height, units = "cm", limitsize = FALSE)
   }
-
-
-  # 3. Create the ggplot
-
-  labeled_points <- joint_result %>%
-    group_by(strategy) %>%
-    mutate(
-      # Calculate the target center for this group
-      target_x = median(median_delay),
-      target_y = median(costs),
-
-      # Calculate Euclidean distance from every point to that center
-      dist_to_center = sqrt((median_delay - target_x)^2 + (costs - target_y)^2)
-    ) %>%
-    # Keep only the point with the smallest distance
-    filter(dist_to_center == min(dist_to_center)) %>%
-    slice(1) # Handle ties
-
-  cost_effectiveness <- ggplot(joint_result, aes(x = median_delay, y = costs, color = strategy)) +
-    # Add points (increase size for visibility)
-    geom_point(size = 1, alpha = 0.25) +
-    geom_text(
-      data = labeled_points,
-      aes(label = paste0(strategy, "\n(", sprintf(paste0("%.", decimals, "f"), target_y), "M $, ", sprintf(paste0("%.", decimals, "f"), target_x), "d)"), x = target_x, y = target_y + 0.0),
-      vjust = -0.5,
-      fontface = "bold",
-      lineheight = 0.8,
-      size=4,
-      show.legend = FALSE
-    ) +
-    geom_point(data = labeled_points, size = 4, shape = 3, color="black") +
-    # Optional: Manually choose your colors and symbols
-    scale_color_manual(values = c("EF" = pirche_color_four[3], "SF" = pirche_color_four[1], "PF" = pirche_color_four[4])) +
-    # Clean up the theme
-    theme_light() +
-    ylim(0.9*min(joint_result$costs), 1.1*max(joint_result$costs)) +
-    xlim(0.8*min(joint_result$median_delay), max(joint_result$median_delay)) +
-    labs(
-      title = paste0("Cost effectiveness of schedules\nin detecting ABMR (n = ", n_patients, ")"),
-      x = "median days to detection (lower is better)",
-      y = "costs in millions (lower is better)",
-      color = "Schedule"
-    )
-  ggsave(paste0(manuscript_root, "cost_effectiveness_", index ,".png"), plot = cost_effectiveness, dpi = dpi, width = fig_width, height = height, units = "cm", limitsize = FALSE)
-
-
 }
 
-global_result$simulation <- as.factor(global_result$simulation)
-mapping <- c("1" = "Utah", "2" = "Leuven", "3" = "Basel")
-
-# Apply the mapping
-global_result <- global_result %>%
-  mutate(simulation = recode(as.character(simulation), !!!mapping))
-global_result$simulation <- as.factor(global_result$simulation)
-
 global_result$strategy <- factor(global_result$strategy, levels = c("SF", "EF", "PF"))
+global_result$simulation <- as.factor(global_result$simulation)
+global_result$scenario <- as.factor(global_result$scenario)
 
 # 2. Create the plot
 global_plot <- ggplot(global_result, aes(x = simulation, y = median_delay, fill = strategy)) +
@@ -578,7 +454,7 @@ test_effectiveness <- ggplot(summary_data, aes(x = x_median, y = y_median)) +
   # CRITICAL FIX: Use coord_cartesian instead of xlim/ylim to prevent data clipping
   coord_cartesian(
     ylim = c(0.9 * min(global_result$tests, na.rm = TRUE), 1.2 * max(global_result$tests, na.rm = TRUE)),
-    xlim = c(min(global_result$median_delay, na.rm = TRUE) - 55, max(global_result$median_delay, na.rm = TRUE) - 35)
+    xlim = c(min(global_result$median_delay, na.rm = TRUE) - 10, max(global_result$median_delay, na.rm = TRUE) - 290)
   ) +
 
   labs(
@@ -632,10 +508,10 @@ test_comparison <- summary_data %>%
 
 print(test_comparison, width = Inf)
 
-my_comparisons <- list( c("EF", "SF"), c("SF", "PF") )
+my_comparisons <- list( c("SF", "PF") )
 
 global_result_norm <- global_result %>%
-  group_by(iteration, simulation) %>%
+  group_by(iteration, simulation, scenario) %>%
   mutate(
     # Min-Max Scaling calculated strictly within each strategy's group
     Delay_Scaled = (median_delay - min(median_delay, na.rm = TRUE)) /
@@ -680,7 +556,7 @@ nttd_boxplot <- ggplot(global_result_norm, aes(x = strategy, y = nttd, color=str
     x = "strategy",
     y = "efficiency\nMNT = (1 - mean(n, ttd))"
   ) +
-  scale_y_continuous(limits = c(min(global_result_norm$nttd), max(global_result_norm$nttd) + length(my_comparisons) * 0.08)) +
+  scale_y_continuous(limits = c(min(global_result_norm$nttd), max(global_result_norm$nttd) + length(my_comparisons) * 0.10)) +
 
   theme(
     legend.position = "none"
